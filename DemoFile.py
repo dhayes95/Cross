@@ -34,7 +34,7 @@ if __name__ =="__main__":
     t4 = time.perf_counter()
     print("Serial time: {}".format(t4-t3))
     
-    """
+    
     #Construct cores
     par_cores = Recursive_Core_Extract(X, par_I_row, par_I_col)
     ser_cores = Recursive_Core_Extract(X, ser_I_row, ser_I_col)
@@ -46,4 +46,4 @@ if __name__ =="__main__":
     #Print errors
     print("Parallel error: {}".format(np.linalg.norm(X - par_X_approx)/np.linalg.norm(X)))
     print("Serial error: {}:".format(np.linalg.norm(X - ser_X_approx)/np.linalg.norm(X)))
-    """
+    
