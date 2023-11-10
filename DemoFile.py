@@ -24,7 +24,7 @@ if __name__ =="__main__":
     ranks = [5,5,5,5]
     
     #Can uncomment lines 27 & 28 and comment lines 23 & 24 to test with Hilbert tensor
-    #X = np.fromfunction(lambda i0,i1,i2,i3: 1.0/(i0+i1+i2+i3+1),(50,50,50,50))
+    #X = np.fromfunction(lambda i0,i1,i2,i3: 1.0/(i0+i1+i2+i3+1),(100,100,100,100))
     #ranks = [5,5,5]
     
     print("Tensor built \nBeginning TT computations...")
