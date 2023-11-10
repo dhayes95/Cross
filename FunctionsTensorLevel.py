@@ -87,7 +87,6 @@ def MatrixSuperblock(X_ten,I,J,k):
     
     X_super = KSuperblock(X_ten, I, J, k)
     
-    #Matrix_Superblock = Matricization(np.transpose(X_super,[0,1,3,2]),[0,1])[0]
     Matrix_Superblock = Unfolding(np.transpose(X_super,[0,1,3,2]), 1)
         
     return Matrix_Superblock
@@ -101,10 +100,6 @@ def CrossInterpSingleItemSuper(A,Ir,Ic,FIr,FIc,k,Xsize):
     sample_size = 10
     
     if k==0:
-        #print(k)
-        #A = MatrixSuperblock(X, [0], Ic[1], 0)
-        #print(np.linalg.matrix_rank(A))
-        #Ii,Jj = OneStepCrossInterp2(A, Ir[0], Ic[0], sample_size, 10)
         Ii,Jj = Greedy_Pivot_Search(A,Ir[0],Ic[0])
         if Ii[-1] not in Ir[0] or Jj[-1] not in Ic[0]:
             Ir[0] = np.append(Ir[0],Ii[-1])
@@ -117,11 +112,6 @@ def CrossInterpSingleItemSuper(A,Ir,Ic,FIr,FIc,k,Xsize):
             
         
     elif k==len(Ir)-1:
-        #print(k)
-        
-        #A = MatrixSuperblock(X, Ir[-2], [0], k)
-        #print(np.linalg.matrix_rank(A))
-        #Ii,Jj = OneStepCrossInterp2(A, Ir[k], Ic[k], sample_size, 10)
         Ii,Jj = Greedy_Pivot_Search(A,Ir[k],Ic[k]) 
         if Ii[-1] not in Ir[k] or Jj[-1] not in Ic[k]:
             Ir[k] = np.append(Ir[k],Ii[-1])
@@ -134,11 +124,6 @@ def CrossInterpSingleItemSuper(A,Ir,Ic,FIr,FIc,k,Xsize):
         
         
     else:
-        #print(k)
-        #A = MatrixSuperblock(X, Ir[k-1], Ic[k+1], k)
-        
-        #print(np.linalg.matrix_rank(A))
-        #Ii,Jj = OneStepCrossInterp2(A, Ir[k], Ic[k], sample_size, 100)
         Ii,Jj = Greedy_Pivot_Search(A,Ir[k],Ic[k])
         if Ii[-1] not in Ir[k] or Jj[-1] not in Ic[k]:
             Ir[k] = np.append(Ir[k],Ii[-1])
@@ -168,48 +153,33 @@ def Greedy_TT_Cross_Approx_Super(X,rs):
     FIr = list(np.zeros([len(X.shape)-1,1],dtype = int))
     FIc = list(np.zeros([len(X.shape)-1,1],dtype = int))
     
-    #dim = X.shape
-    #for k in range(len(dim)-1):
-    #    Ir[k][0],Ic[k][0] = np.unravel_index(np.argmax(MatrixSuperblock(X, [0], [0], k)),(dim[k],dim[k+1]))
-    #    FIr[k][0],FIc[k][0] = Matrix_Super_Index_Conversion(Ir[k][0], Ic[k][0], [0], [0], k, dim)
-    counter = 0
-    
 
     for k in range(np.max(rs)-1):
         if k%2==0:
             for j in range(len(rs)):
                 if rs[j]>1:
-                    #duplicate_check = len(FIr[j])+len(FIc[j])
                     if j==0:
                         A = MatrixSuperblock(X, [0], Ic[1], 0)
                     elif j==len(rs)-1:
-                        A = MatrixSuperblock(X, Ir[-2], [0], j)
-                        
+                        A = MatrixSuperblock(X, Ir[-2], [0], j)  
                     else:
-                        
                         A = MatrixSuperblock(X, Ir[j-1], Ic[j+1], j)
-                    
-                    
+                        
                     Ir,Ic,FIr,FIc = CrossInterpSingleItemSuper(A, Ir, Ic, FIr,FIc, j,X.shape)
-                    
                     rs[j]-=1
-                         
-                            
-                
+                             
         else:
             for j in range(len(rs)-1,-1,-1):
                 if rs[j]>1:
                     if j==0:
                         A = MatrixSuperblock(X, [0], Ic[1], 0)
                     elif j==len(rs)-1:
-                        A = MatrixSuperblock(X, Ir[-2], [0], j)
-                        
+                        A = MatrixSuperblock(X, Ir[-2], [0], j)  
                     else:
                         A = MatrixSuperblock(X, Ir[j-1], Ic[j+1], j)
                     Ir,Ic,FIr,FIc = CrossInterpSingleItemSuper(A, Ir, Ic, FIr,FIc, j,X.shape)
                     rs[j]-=1
-        
-        #print(rs)
+
 
     return FIr,FIc
 
@@ -225,17 +195,14 @@ def Dimension_Parallel_TT_Cross_Super(X,rs):
     
     for j in range(np.max(rs)-1):
         returns = []
-        #iters = [(X,Ir,Ic,FIr,FIc,i) for i in range(len(dim)-1) if rs[i]>1]
         iters = []
         for i in range(len(dim)-1):
             if rs[i]>1:
                 if i==0:
                     A = MatrixSuperblock(X, [0], Ic[1], 0)
                 elif i==len(rs)-1:
-                    A = MatrixSuperblock(X, Ir[-2], [0], i)
-                            
+                    A = MatrixSuperblock(X, Ir[-2], [0], i)            
                 else:
-                            
                     A = MatrixSuperblock(X, Ir[i-1], Ic[i+1], i)
                 iters.append((A,Ir,Ic,FIr,FIc,i,dim))
         
@@ -244,6 +211,7 @@ def Dimension_Parallel_TT_Cross_Super(X,rs):
                 returns.append(items)
         pool.close()
         pool.join()
+        
         rs = [rs[i]-1 for i in range(len(dim)-1)]
         for i in range(len(iters)):
             Ir[iters[i][-2]] = returns[i][0][iters[i][-2]]
@@ -258,18 +226,14 @@ def Dimension_Parallel_TT_Cross_Super(X,rs):
 
 def Recursive_Core_Extract(X,Ir,Ic):
     dim = np.shape(X)
-    
     if len(Ir)!=len(Ic):
         raise  ValueError("The row index and column index sets are not compatible length")
         
-    
-    
     cores = list(np.zeros(len(dim)))
     
     for i in range(len(dim)):
         
         if i==0:
-            #A = Matricization(X, [0])[0]
             A = Unfolding(X,0)
             Tk = recursive_Tk(A, Ir[0], Ic[0])
             cores[i] = np.reshape(Tk,[1,dim[i],len(Ic[i])])
@@ -283,38 +247,17 @@ def Recursive_Core_Extract(X,Ir,Ic):
                     cores[i][k,j,0] = X[tuple(p)+tuple([j])]
         else:
             cores[i]=np.zeros([len(Ir[i-1]),dim[i],len(Ic[i])])
-            #A = Matricization(X,list(np.arange(i+1)))[0]
             A = Unfolding(X,i)
             ind = []
-            #for j in range(len(Ir[i-1])):
-            #    p = np.unravel_index(Ir[i-1][j],dim[:i])
-            #    for k in range(dim[i]):
-            #        tupind = tuple(p) + tuple([k])
-            #        converted_tuple = np.ravel_multi_index(tupind, dim[:i+1])
-            #        newindexing = np.append(newindexing,converted_tuple)
-                    #        for l in range(len(Ic[i])):
-            #            q = np.unravel_index(Ic[i][l], dim[i+1::])
-                        
-                        #print(p,k,q)
-            #            cores[i][j,k,l] = X[tuple(p)+tuple([k])+tuple(q)]
-            #W = np.reshape(cores[i],[len(Ir[i-1])*dim[i],len(Ic[i])])
-            #cores[i] = np.reshape(W@np.linalg.inv(A[Ir[i],:][:,Ic[i]]),[len(Ir[i-1]),dim[i],len(Ic[i])])
-            
+
             for j in range(len(Ir[i-1])):
                 p = np.unravel_index(Ir[i-1][j],dim[:i])
                 for k in range(dim[i]):
                     ind = np.append(ind,np.ravel_multi_index(tuple(p)+tuple([k]),dim[:i+1]))
             ind = ind.astype(int)
-            
-            #for j in range(len(Ir[i-1])):
-            #    newindexing = np.append(newindexing, np.unravel_index(np.ravel_multi_index((Ir[i-1][j],0),(np.prod(dim[:i]),np.prod(dim[i::]))),A.shape)[0])
-            #newindexing = np.append(newindexing,np.arange(dim[i]))
-            #newindexing = newindexing.astype(int)
-            #tt1 = time.time()
             Tk = recursive_Tk(A,Ir[i],Ic[i])
             cores[i] = np.reshape(Tk[ind,:],[len(Ir[i-1]),dim[i],len(Ic[i])])
-            #tt2 = time.time()
-            #print(tt2-tt1,i)
+
     return cores
 
 
