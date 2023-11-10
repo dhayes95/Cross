@@ -97,7 +97,6 @@ def MatrixSuperblock(X_ten,I,J,k):
 
 def CrossInterpSingleItemSuper(A,Ir,Ic,FIr,FIc,k,Xsize):
     flag =0
-    sample_size = 10
     
     if k==0:
         Ii,Jj = Greedy_Pivot_Search(A,Ir[0],Ic[0])
