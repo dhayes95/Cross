@@ -21,16 +21,22 @@ if __name__ =="__main__":
     
     #Tensor input
     X = np.random.rand(72,72,72,72,72)
-    print("Tensor built")
+    ranks = [5,5,5,5]
+    
+    #Can uncomment lines 27 & 28 and comment lines 23 & 24 to test with Hilbert tensor
+    #X = np.fromfunction(lambda i0,i1,i2,i3: 1.0/(i0+i1+i2+i3+1),(50,50,50,50))
+    #ranks = [5,5,5]
+    
+    print("Tensor built \nBeginning TT computations...")
     
     
     #Compute row and column indices both in parallel(dimension) and serial
     t1 = time.perf_counter()
-    par_I_row,par_I_col = Dimension_Parallel_TT_Cross_Super(X, [5,5,5,5])
+    par_I_row,par_I_col = Dimension_Parallel_TT_Cross_Super(X, ranks)
     t2 = time.perf_counter()
     print("Parallel time: {}".format(t2-t1))
     t3 = time.perf_counter()
-    ser_I_row,ser_I_col = Greedy_TT_Cross_Approx(X, [5,5,5,5])
+    ser_I_row,ser_I_col = Greedy_TT_Cross_Approx(X, ranks)
     t4 = time.perf_counter()
     print("Serial time: {}".format(t4-t3))
     
