@@ -26,6 +26,7 @@ def recursive_Tk(A,I,J):
     -------
     Tk : A[:,J]@np.linalg.pinv(A[I,J])
 
+    Note: This function is used for the TT cross core construction
     """
     dim = A.shape
     Ilen = len(I)
