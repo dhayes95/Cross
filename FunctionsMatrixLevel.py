@@ -14,8 +14,6 @@ import random
 
 def recursive_Tk(A,I,J):
     """
-    
-
     Parameters
     ----------
     A : Matrix
@@ -30,28 +28,26 @@ def recursive_Tk(A,I,J):
     """
     dim = A.shape
     Ilen = len(I)
-    
-    
+        
     #Initalize with exact first
     Itemp = I[:1]
     Jtemp = J[:1]
 
     Tk = A[:,Jtemp]@np.linalg.pinv(A[Itemp,:][:,Jtemp])
+    # Tk = A[:,J[0]]/A[I[0],J[0]];
 
     for i in range(1,Ilen):
         Itemp = I[:i]
         Jtemp = J[:i]
-        
-        
-        
+              
         ii = I[i]
         jj = J[i]
-        
-        
-        
+               
         Sk = np.reshape(Tk,[dim[0],i])@A[Itemp,:][:,jj] - A[:,jj]
         e1 = np.zeros([1,dim[0]])
         e1[0,ii]=1
+
+        # Sk = Tk@A[Itemp,:][:,jj] - A[:,jj]
         
         
         delta1 = (e1@Sk)
@@ -61,20 +57,50 @@ def recursive_Tk(A,I,J):
             delta = 1.0/delta1
 
         a = np.reshape(Tk,[dim[0],i]) - delta*np.outer(np.reshape(Sk,[dim[0],1]),np.reshape(Tk[ii,:],[1,Tk.shape[1]]))
-        
-        b = np.reshape(delta*Sk,[dim[0],1])
-
-            
+        b = np.reshape(delta*Sk,[dim[0],1])       
         Tk = np.concatenate((a,b),axis=1)
 
+        # if Sk[ii] == 0:
+        #     delta = 0
+        # else:
+        #     delta = 1.0/Sk[ii]
+
+        # Tk = np.concatenate((Tk - delta*Sk@Tk[ii,:], delta*Sk), axis=1)
     
     return Tk
 
+def recursive_Tk_update(A,Tk_old,I,J):
+    """
+    Parameters
+    ----------
+    A : Matrix
+    Tk_old : Tk generated at the previous step
+    I : row indices currently selected
+    J : column indices currently selected
+
+    Returns
+    -------
+    Tk : A[:,[J,jj]]@np.linalg.pinv(A[[I,ii],[J,jj]]), new Tk matrix
+
+    Note: This function is used for the TT cross core construction
+    """
+    Ilen = len(I)
+    Itemp = I[:Ilen-1]
+    ii = I[Ilen-1]
+    jj = J[Ilen-1]
+    
+    Sk = Tk_old@A[Itemp,:][:,jj] - A[:,jj]
+    if Sk[ii] == 0:
+        delta = 0
+    else:
+        delta = 1.0/Sk[ii]
+
+    Tk = np.concatenate((Tk_old - delta*Sk@Tk_old[ii,:], delta*Sk), axis=1)
+    
+    return Tk
 
 def Recursive_CUR(A,I,J,tol):
     """
-    
-
     Parameters
     ----------
     A : Matrix
@@ -85,7 +111,6 @@ def Recursive_CUR(A,I,J,tol):
     Returns
     -------
     Atilde : CUR
-
     """
     
     dim = A.shape
@@ -101,11 +126,38 @@ def Recursive_CUR(A,I,J,tol):
             break
         else: 
             Atilde = Atilde + (1.0/deltainv)*np.outer(E[:,J[k]],E[I[k],:])
+
+        # deltainv = A[I[k],J[k]] - Atilde[I[k],J[k]]
+        # if np.abs(deltainv) <= tol:
+        #     break
+        # else: 
+        #     Atilde = Atilde + (1.0/deltainv)*np.outer(A[:,J[k]]-Atilde[:,J[k]],A[I[k],:]-Atilde[I[k],:])
            
 
     return Atilde
 
 
+def Recursive_CUR_update(A,Atilde_old,ii,jj,tol):
+    """
+    Parameters
+    ----------
+    A : Matrix
+    Atilde_old : approximation at the previous iteration
+    ii : newly selected row pivot
+    jj : newly selected column pivot
+    tol : tolerance for delta parameter
+
+    Returns
+    -------
+    Atilde : CUR
+    """
+    deltainv = A[ii,jj] - Atilde_old[ii,jj]
+    if np.abs(deltainv) <= tol:
+        Atilde = Atilde_old
+    else: 
+        Atilde = Atilde_old + (1.0/deltainv)*np.outer(A[:,jj]-Atilde_old[:,jj],A[ii,:]-Atilde_old[ii,:])
+
+    return Atilde
 
 
 def Greedy_Pivot_Search(A,I,J,sample_size=3,maxiter=10,tol=1e-16):
@@ -139,6 +191,79 @@ def Greedy_Pivot_Search(A,I,J,sample_size=3,maxiter=10,tol=1e-16):
         #If non-empty then create Atilde recursively
         Atilde = Recursive_CUR(A,I,J,tol)
         
+        #Only sample unused indices
+        Asub = np.delete(np.delete(A,I,0),J,1)
+        Atildesub = np.delete(np.delete(Atilde,I,0),J,1)
+        subdim = Asub.shape
+
+        #Get adjusted sample size
+        sample_number = np.min([sample_size,subdim[0],subdim[1]])
+        
+        #Generate random skeleton to begin search
+        Irandom = random.sample(list(np.arange(subdim[0])),sample_number)
+        Jrandom = random.sample(list(np.arange(subdim[1])),sample_number)
+     
+    #Needed for tracking true index. Not needed if you search over whole matrix
+    Row_track = np.delete(np.arange(dim[0]),I,0)
+    Col_track = np.delete(np.arange(dim[1]),J,0)
+
+    #Set up counter for iterations    
+    iteration_count = 0
+    
+    #Initial pivot in skeleton error
+    E = np.abs(Asub-Atildesub)
+    i_star,j_star = np.unravel_index(np.argmax(E[Irandom,Jrandom]),subdim)
+
+    #Main while loop
+    while iteration_count < maxiter:
+
+        i_star = np.argmax(E[:,j_star])
+        j_star = np.argmax(E[i_star,:])
+
+        #Check rook condition
+        if all([E[i_star,j_star]>E[m,j_star] for m in range(subdim[0])]) \
+            and all([E[i_star,j_star]>E[i_star,n] for n in range(subdim[1])]):
+            break
+        iteration_count+=1
+    
+    
+    I_new = np.append(I,Row_track[i_star]).astype(int)
+    J_new = np.append(J,Col_track[j_star]).astype(int)
+
+
+    
+    return I_new,J_new
+
+
+def Greedy_Pivot_Search_update(A,Atilde,I,J,sample_size=3,maxiter=10,tol=1e-16):
+    """
+    Input:
+        A - Matrix 
+        Atilde - Current approximation
+        I - Row indices
+        J - Column indices
+        sample_size - Number of random samples
+        maxiter - maximum iteration count 
+        tol - tolerance for CUR recursive construction
+
+    Output:
+        I_new - Enriched row indices
+        J_new - Enriched column indices
+    """
+
+    dim = A.shape
+    
+
+    #Check if I and J are empty
+    #This if-else statement takes care of empty indices, and if non-empty then 
+    #only search along unslected rows and columns
+    if len(I)==0 and len(J)==0:
+        Asub = A
+        Atildesub = np.zeros(dim)
+        subdim = dim
+        Irandom = random.sample(list(np.arange(dim[0])),sample_size)
+        Jrandom = random.sample(list(np.arange(dim[1])),sample_size)
+    else:
         #Only sample unused indices
         Asub = np.delete(np.delete(A,I,0),J,1)
         Atildesub = np.delete(np.delete(Atilde,I,0),J,1)

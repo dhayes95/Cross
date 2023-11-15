@@ -92,8 +92,17 @@ def MatrixSuperblock(X_ten,I,J,k):
     return Matrix_Superblock
 
 
+def MatrixSuperblock_new(X_ten,I,J,k):
+    """
+    Combine KSuperblock and MatrixSuperblock
+    Directly generate the superblock instead of a 4D tensor and then flatten
+    Avoid using nested for loops, use vectorized operations, such as taking submatrices
 
-
+    For example, when 0 < k < len(dim)-2
+    X_mat = Unfolding(X_ten, k-1)
+    Matrix_Superblock = X_mat(dim[k]*prod(dim[0:k])+I, dim[k+1]*prod(dim[k+2::])+J)
+    It'll even better if we don't need to build the unfolding first, but directly take subtensors, but I don't know how that works with Python tuples
+    """
 
 def CrossInterpSingleItemSuper(A,Ir,Ic,FIr,FIc,k,Xsize):
     flag =0
