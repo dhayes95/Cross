@@ -102,7 +102,7 @@ where $0\leq\epsilon<1$ is an accuracy tolerance~\cite{grasedyck2013literature,h
 
 In order to exploit modern computing architectures, researchers have proposed various methods for tensor decomposition in CP~\cite{li2017model,smith2015splatt}, Tucker and hierarchical Tucker~\cite{austin2016parallel,grasedyck2019parallel,ballard2020tuckermpi,kaya2016high}, and TT~\cite{shi2023parallel,grigori2020parallel,chen2017parallelized,wang2020adtt,dolgov2020parallel} format. In addition, tensor operations in TT format, including addition and multiplication~\cite{daas2022parallel}, contraction~\cite{solomonik2014massively}, and recompression~\cite{al2023randomized} can be executed in parallel as well. The major challenge we address in this paper is to construct an approximation $\tilde{\mathcal{X}}$ in a TT format from large $\mathcal{X}$ with distributed memory parallelism. This allows one to partition $\mathcal{X}$ into smaller blocks so that each processor handles a significantly smaller chunk of data. Furthermore, with a successful distributed memory design, all processors can execute individual shared memory parallel algorithms and minimize communications with each other, leading to efficient computational and storage consumption.
 
-In this paper, we build a distributed memory framework based on subtensors and use it for TT decomposition. A subtensor is a multilinear generalization of a submatrix, and has been used in the matricized-tensor times Khatri-Rao product (MTTKRP)~\cite{ballard2018, ballard2020}, hierarchical subtensor decomposition~\cite{ehrlacher2021}, parallel Tucker decomposition~\cite{ballard2020tuckermpi}, and parallel TT decomposition~\cite{shi2023parallel}. With this framework, one can choose any tensor algorithm and instruct all subtensors to execute it independently. In the end, results on subtensors are gathered to form the outcome of the entire tensor. Specifically, we construct a multidimensional processor grid for subtensor partitioning. This enables us to derive explicit bounds on the bandwidth and communication costs corresponding to the selected tensor algorithms. In particular, we focus on two algorithms:
+In this paper, we build a distributed memory framework based on subtensors and use it for TT decomposition. A subtensor is a multilinear generalization of a submatrix, and has been used in the matricized-tensor times Khatri-Rao product (MTTKRP)~\cite{ballard2018, ballard2020}, hierarchical subtensor decomposition~\cite{ehrlacher2021}, parallel Tucker decomposition~\cite{ballard2020tuckermpi}, and parallel TT decomposition~\cite{shi2023parallel}. With this framework, one can choose any tensor algorithm and instruct all subtensors to execute it independently. In the end, results on subtensors are gathered to form the outcome of the entire tensor. For the remainder of this paper, we call this subtensor parallelism, as opposed to dimension parallelism in past literature. Dimension parallel algorithms partition computations with respect to the dimension of the tensor, and thus the number of processors used actively is limited even in the distributed memory setting. In subtensor parallelism, we construct a multidimensional processor grid for subtensor partitioning, and we can run dimension parallel algorithms in the shared memory setting on each processor as a bonus. This enables us to derive explicit bounds on the bandwidth and communication costs corresponding to the selected tensor algorithms. In particular, we focus on two algorithms:
 \begin{itemize}[leftmargin=*,noitemsep]
 \item \textbf{Subtensor Parallel TT Cross}: In many applications such as numerical integration in quantum mechanics~\cite{meyer1990multi} and inverse problems with uncertainty~\cite{stuart2010inverse}, and data analysis in statistical science~\cite{mccullagh2018tensor} and machine learning~\cite{rabanser2017introduction}, tensors are often formed without an exact formula and can be extremely sparse. In these cases, researchers develop TT cross~\cite{oseledets2010tt} and dimension parallel TT cross~\cite{dolgov2020parallel} for data centric TT approximation. In~\cref{sec:subTTcross}, we extend the pivot selection algorithm in dimension parallel TT cross on the entire tensor to local pivot selection on subtensors, and show the nestedness of the pivots still hold. Then, we can apply dimension parallel TT cross on each subtensor in a shared memory setting, and we can show our algorithm can obtain a comparably good approximation with minimal communication.
 
@@ -114,34 +114,24 @@ We implement our parallel algorithms with both distributed and shared memory par
 
 
 \section{Tensor notations, TT format, and decomposition algorithms} \label{sec:background}
-In this section, we review some tensor notations, the TT format for low rank tensor approximations, and some TT decomposition algorithms. Throughout this paper, for a tensor $\mathcal{X}$, we look for an approximation $\tilde{\mathcal{X}}$ that has low tensor ranks and satisfies~\cref{eq:FrobeniusNorm} for some $0 < \epsilon < 1$.
+In this section, we review some tensor notations, the TT format for low rank tensor approximations, and some TT decomposition algorithms. Throughout this paper, we aim to obtain an approximation $\tilde{\mathcal{X}}$ with low TT ranks of a given tensor $\mathcal{X}$. Whenever possible, we further require the approximation satisfies~\cref{eq:FrobeniusNorm} for some $0 < \epsilon < 1$.
 
 \subsection{Tensor notation} \label{sec:notation}
-We use upper class letters to represent matrices and calligraphic capital letters to represent tensors. We commonly use MATLAB-style notation ``:" for indices, i.e., $a\!:\!b$ represents the index set $\{a,a+1,\ldots,b\}$, and a single ``:" stands for all the indices in that dimension. For example, $A(:,3\!:\!4)$ or $A_{:,3:4}$ represents the submatrix of $A$ that contains its third and fourth columns, and $\mathcal{Y}(:,j,:)$ represents the matrix slice of the tensor $\mathcal{Y}$ by fixing the second index to be $j$. We also use $\mathcal{Y}(:)$ to stack all the entries of $\mathcal{Y}$ into a single vector using column-major ordering. We use the MATLAB command ``reshape" to reorganize elements of a tensor. If $\mathcal{Y} \in \C^{n_1 \times n_2 \times n_3}$, then ${\rm reshape}(\mathcal{Y},n_1n_2,n_3)$ returns a matrix of size $n_1n_2 \times n_3$ formed by stacking entries according to their multi-index. Therefore, $\mathcal{Y}(:)$ and ${\rm reshape}(\mathcal{Y},n_1n_2n_3,1)$ are equivalent. Similarly, if $Z \in \C^{n_1 n_2 \times n_3}$, then ${\rm reshape}(Z,n_1,n_2,n_3)$ returns a tensor of size $n_1 \times n_2 \times n_3$. Throughout, we use the notation for tensors found in~\cite{kolda2009tensor}, which we briefly review now for readers' convenience. Consider a tensor $\mathcal{X}\in\C^{n_1\times\cdots\times n_d}$, then we have the following definitions.
+We use lower class letters for vectors, capital letters for matrices, and calligraphic capital letters for tensors. For notational simplicity, we use MATLAB-style notation to start index counting from 1, and the symbol ``:" in indexing. This includes using $a\!:\!b$ to represent the inclusive index set $\{a,a+1,\ldots,b\}$, and a single ``:" to represent all the indices in that dimension from start to end. For example, if $\mathcal{Y} \in \R^{4 \times 8 \times 10}$, then $\mathcal{Y}(:,4\!:\!6,:)$ denotes a subtensor of $\mathcal{Y}$ with size $4 \times 3 \times 10$. In addition, we use the simplified notation $A_k$ to represent the $k$th column of the matrix $A$ instead of $A(:,k)$. In this way, $(A^T)_\ell$ is used for the $\ell$th row of $A$. Finally, we use index sets for submatrix and subtensor selection. For example, $A(:,J)$ is a submatrix of $A$ with columns $A_j$ for all $j \in J$.
 
-\begin{description}[leftmargin=*,noitemsep]
-\item[Flattening by reshaping.]
-One can reorganize the entries of a tensor into a matrix without changing the column-major ordering, and this idea is fundamental to the TT decomposition. The $k$th unfolding of $\mathcal{X}$ is represented as
-\[X_k={\rm reshape}\left(\mathcal{X},\prod_{s=1}^k n_s,\prod_{s=k+1}^d n_s\right). \]
-
-\item[Flattening via matricization.]
-Another way to flatten a tensor is to arrange the mode-$n$ fibers to be the columns of a matrix~\cite{kolda2006multilinear}, and this operation is central for the orthogonal Tucker decomposition. We denote the $k$th matricization of $\mathcal{X}$ by $X_{(k)} \in \C^{n_k \times \prod_{j\neq k} n_j}$. Since mode-1 fibers are the tensor columns, we have $X_{(1)}=X_1$.
-
-\item[The $k$-mode product.] The $k$-mode product of $\mathcal{X}$ with a matrix $A\in\C^{m \times n_k}$ is denoted by $\mathcal{X} \times_k A$, and defined elementwise as
-\begin{equation}
-(\mathcal{X} \times_k A)_{i_1,\ldots,i_{k-1},j,i_{k+1},\ldots,i_d} = \sum_{i_k = 1}^{n_k} \mathcal{X}_{i_1,\ldots,i_d}A_{j,i_k}, \quad 1 \le j \le m.
-\label{eq:kfold}
-\end{equation}
-This is equivalent to computing $AX_{(k)}$ and reorganizing back to a tensor.
-
-\end{description}
+In addition, we use the MATLAB command ``reshape" to form a new structure according to the multi-index via reorganizing elements without changing the element ordering. For example, if $\mathcal{Y} \in \C^{n_1 \times n_2 \times n_3}$, then $Z = {\rm reshape}(\mathcal{Y},n_1n_2,n_3)$ returns a matrix of size $n_1n_2 \times n_3$ formed by stacking entries, and similarly, $\mathcal{Y} = {\rm reshape}(Z,n_1,n_2,n_3)$. The command ``reshape" is essential when flattening a tensor into matrices, which we refer to as the unfoldings of a tensor. Tensor unfoldings are fundamental to the TT format, especially in developing practical TT decomposition algorithms and bounding TT ranks. For a tensor $\mathcal{X}\in\C^{n_1\times\cdots\times n_d}$, we denote the $k$th unfolding as
+\[X_k={\rm reshape}\left(\mathcal{X},\prod_{s=1}^k n_s,\prod_{s=k+1}^d n_s\right), \quad 1 \le k \le d-1.\]
 
 \subsection{Tensor-train format} \label{sec:TT}
-The TT format represents each tensor entry as the product of a sequence of matrices. A tensor $\mathcal{X}\in\C^{n_1\times \cdots \times n_d}$ has TT cores $\mathcal{G}_k \in \C^{s_{k-1} \times n_k \times s_k}$ for $1 \le k \le d$, if the cores satisfy
+The TT format of a tensor $\mathcal{X}\in\C^{n_1\times \cdots \times n_d}$ comprises of $d$ TT cores, $\mathcal{G}_k \in \C^{s_{k-1} \times n_k \times s_k}$ for $1 \le k \le d$, and takes the representation
 \[
 \mathcal{X}_{i_1,\ldots,i_d} = \mathcal{G}_1(:,i_1,:)\mathcal{G}_2(:,i_2,:) \cdots \mathcal{G}_d(:,i_d,:), \qquad 1\leq i_k \leq n_k.
 \]
-Since the product of the matrices must be a scalar, we have $s_0 = s_d = 1$. We call $\pmb{s} = (s_0,\ldots,s_d)$ the size of the TT cores, which relates to any accurate TT representation of a given tensor. The vector $\pmb{s}$ is bounded from below entry-by-entry by the TT rank $\pmb{r}= (r_0,\ldots,r_d)$, which is defined to be the vector containing the smallest possible TT core size. For example, the TT representation that enforces orthonormality in columns or rows of the TT cores, such as the one computed via TTSVD~\cite{oseledets2011tensor}, has a quasi-optimal guarantee of the TT core size. In this way, a TT representation with TT core size $\pmb{s}$ requires $\sum_{k=1}^d s_{k-1}s_k n_k$ degrees of freedom for storage, which is linear in mode size $\pmb{n}=(n_1,\ldots,n_d)$ and order $d$.~\cref{fig:TT} illustrates a TT format with TT core size $\pmb{s}$.
+In other words, each element in $\mathcal{X}$ can be computed as the product of a sequence of matrices. The vector $\pmb{s} = (s_0,\ldots,s_d)$ is referred to as the size of the TT cores, and in order for the product to be compatible, we require $s_0 = s_d = 1$. This TT representation thus has a storage cost of $\sum_{k=1}^d s_{k-1}s_k n_k$, which is linear with respect to both $d$ and $n_k$. In addition, we call a vector $\pmb{r}= (r_0,\ldots,r_d)$ the TT rank if $\pmb{r}$ contains entry-by-entry smallest possible values of the TT core size. In practice, the exact TT rank is hard to recover, so we either aim to obtain quasi-optimal TT core size from a given threshold, or build an accurate tensor approximation with small pre-selected TT core size. It is shown in~\cite{oseledets2011tensor} that ranks of tensor unfoldings bound the TT rank from above, so we hope to use $\pmb{s}$ that satisfies
+\begin{equation} \label{eq:TT_trivial}
+r_k \le s_k \le {\rm rank}(X_k), \quad 1 \le k \le d-1,
+\end{equation}
+where $\rank(X_k)$ is the rank of the $k$th unfolding of $\mathcal{X}$. Therefore, if the ranks of all $X_k$ are small, the TT format is a memory-efficient representation.~\cref{fig:TT} provides a illustration of a tensor $\mathcal{X}$ in the TT format with TT core size $\pmb{s}$, and one may visualize slices of the TT cores as ``trains".
 \begin{figure}
 \centering
 \begin{tikzpicture}
@@ -149,7 +139,7 @@ Since the product of the matrices must be a scalar, we have $s_0 = s_d = 1$. We 
 \filldraw[black] (1,-0.5) node {$=$};
 \filldraw[color=black,fill=gray!20] (1.5,0) rectangle (4,-.5);
 \filldraw[black] (2.8,-0.25) node {$\mathcal{G}_1(i_1,:)$};
-\filldraw[black] (2.8,0.3) node {$1\! \times \! s_1$};
+\filldraw[black] (2.8,0.3) node {$s_0 \! \times \! s_1$};
 \filldraw[color=black,fill=gray!20] (4.2,0) rectangle (7.1,-2.5);
 \filldraw[black] (5.7,-1.3) node {$\mathcal{G}_2(:,i_2,:)$};
 \filldraw[black] (5.7,0.3) node {$s_1 \! \times \! s_2$};
@@ -159,19 +149,57 @@ Since the product of the matrices must be a scalar, we have $s_0 = s_d = 1$. We 
 \filldraw[black] (9.1,0.3) node {$s_{d-2} \! \times \! s_{d-1}$};
 \filldraw[color=black,fill=gray!20] (10.5,0) rectangle (11,-2.4);
 \filldraw[black] (10.75,-1) node {\rotatebox{270}{$\mathcal{G}_{d}(:,i_{d})$}};
-\filldraw[black] (10.75,0.3) node {$s_{d-1} \! \times \! 1$};
+\filldraw[black] (10.75,0.3) node {$s_{d-1} \! \times \! s_d$};
 \end{tikzpicture}
 \caption{The TT format with TT core size $\pmb{s} = (s_0,\ldots,s_d)$. Each entry of a tensor is represented by the product of $d$ matrices, where the $k$th matrix in the ``train" is selected based on the value of $i_k$.}
 \label{fig:TT}
 \end{figure}
 
-The TTSVD algorithm computes a TT format by sequentially constructing the TT cores~\cite{oseledets2011tensor}. TTSVD aims to enforce orthonormality in the columns of reshaped TT cores for efficiency and analysis purposes. In this way, we can use ranks of the tensor unfoldings to bound entries of the TT rank~\cite{oseledets2011tensor}, and we typically set the TT core size to be smaller than the ranks of the unfolding matrices. That is,
-\begin{equation} \label{eq:TT_trivial}
-r_k \le s_k \le {\rm rank}(X_k), \quad 1 \le k \le d-1,
-\end{equation}
-where $\rank(X_k)$ is the rank of the unfolding matrix $X_k$. Therefore, if the ranks of all the matrices $X_k$ for $1\leq k\leq d-1$ are small, then the TT format of $\mathcal{X}$ is data-sparse. In particular, if SVDs in TTSVD are truncated to have an accuracy of $\epsilon/\sqrt{d-1}$ in the Frobenius norm, then we obtain an approximation $\tilde{\mathcal{X}}$ that satisfies~\cref{eq:FrobeniusNorm} in the TT format. However, TTSVD is sequential, so we wish to further exploit~\cref{eq:TT_trivial} to compute a TT format in parallel. In addition, we can replace the SVD by the randomized SVD (see Algorithm 5.1 in~\cite{che2019randomized}), and we refer to this algorithm as Serial Streaming TT Sketching (SSTT).
+\subsection{TTSVD, TT sketching, and dimension parallel counterparts}
+\label{sec:TTSVDalg}
+If one can access all the entries of a tensor $\mathcal{X}$ at the same time, then TTSVD is the most straightforward TT decomposition algorithm, which constructs the TT cores sequentially~\cite{oseledets2011tensor}. In short, each TT core is discovered as an orthonormal (ON) basis of the column space of a reshape of the remaining information through SVD. The singular values and row space information are then grouped together to find the next TT core. Specifically, if we truncate the SVD with an accuracy of $\epsilon/\sqrt{d-1}$ in the Frobenius norm, then we obtain the TT cores of an approximation $\tilde{\mathcal{X}}$ satisfying~\cref{eq:FrobeniusNorm}. In scenarios that we cannot afford to compute SVD or we can only get elements of the tensor batch by batch, we can replace SVD by randomized SVD in TTSVD, and get the serial TT sketching algorithm~\cite{che2019randomized}. With high probability, serial TT sketching can also generate an accurate approximation $\tilde{\mathcal{X}}$.
 
-\section{Submatrix parallelism for matrix cross approximation}
+In~\cite{shi2023parallel}, the authors use the property that column spaces of tensor unfoldings are connected to develop dimension parallel TTSVD. The algorithm calculates SVD of all tensor unfoldings simultaneously, and computes the TT cores via ON basis of column spaces of adjacent unfoldings. The result approximation can achieve the same level of accuracy as the sequential TTSVD. In addition, since only column space is essential, randomized range finders can be used to substitute SVD and the result algorithm is parallel TT sketching (see~\cref{alg:parallelTTsketching}). There are a couple of variations of parallel TT sketching with better computational and storage efficiency. For example, one can approximate both column and row space to obtain a two-sided parallel TT sketching; one can also replace the final multiplication in line 8 with an approximation so that all the tensor elements are only used once.
+
+\begin{algorithm}
+\caption{Parallel TT sketching: Given a tensor, compute an approximant tensor in TT format using sketching.}
+\begin{algorithmic}[1]
+\label{alg:parallelTTsketching}
+\Require {A tensor $\mathcal{X} \in \C^{n_1 \times \dots \times n_d}$, TT core size $\pmb{r}$, and an oversampling parameter $p$}
+\Ensure {TT cores $\mathcal{G}_1,\ldots,\mathcal{G}_d$ of an approximant $\tilde{\mathcal{X}}$}
+\For {$1 \le j \le d-1$}
+\State Generate $\Phi_j \in \R^{\left(\prod_{k=j+1}^d n_k\right) \times (r_j+p)}$ with i.i.d. standard Gaussian entries.
+\State Calculate $S_j = X_j\Phi_j$, where $X_j$ is the $j$th flattening of $\mathcal{X}$
+\State Compute a CPQR of $S_j$ to obtain $Q_j$ with ON cols and set $Q_j = Q_j(:,\!1\!:\!r_j)$.
+\EndFor
+\For {$1 \le k \le d-2$}
+\State Calculate $W_{k+1} = Q_k^* \ {\rm reshape}(Q_{k+1}, \prod_{i=1}^k n_i ,n_{k+1}r_{k+1})$.
+\State Set $\mathcal{G}_{k+1} = {\rm reshape}(W_{k+1}, r_k, n_{k+1}, r_{k+1})$.
+\EndFor
+\State Set $\mathcal{G}_1 = Q_1$, and $\mathcal{G}_d = Q_{d-1}^*X_{d-1}$.
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Pivot selection and dimension parallel TT cross}
+Algorithms based on SVD can be extremely expensive and unnecessary in many situations. For example, tensors originated from real world datasets are often large and sparse, and we often only want an approximation with an accuracy of a few significant digits. This leads to heuristic data-based methods, such as adaptive cross approximation (ACA). In summary, ACA mainly finds a ``skeleton" of original data for approximation. For example, the CUR factorization of a matrix in the form of
+\[ A \approx CUR = A(:,J)A(I,J)^{-1}A(I,:), \]
+where $I$ and $J$ are two index sets for selection. The key building block in ACA is new pivot selection to enrich the index sets. There are various metrics for selecting, but we focus on a greedy approach outlined in~\cite[Algorithm 2]{dolgov2020parallel}, which is computationally much cheaper than other routines such as max volume selection. Suppose we use $I_{\le k}$ and $I_{>k+1}$ to denote the selected sets of pivots for the $k$th unfolding of a tensor $\mathcal{X}$ and $\mathbb{I}_\ell$ to denote the set of all indices for dimension $\ell$ with $1 \le k \le d-1$ and $1 \le \ell \le d$, then one step of finding new pivots is described in~\cref{alg:TTcross}. Additionally, pivots selected this way can be shown to satisfy the nestedness property, which ensures that pivots found in one tensor unfolding can be carried over to subsequent unfoldings. As a result,~\cref{alg:TTcross} is automatically a dimension parallel algorithm.
+
+\begin{algorithm}
+\caption{One step of finding new pivots in TT cross.}
+\begin{algorithmic}[1]
+\label{alg:TTcross}
+\Require {A tensor $\mathcal{X} \in \C^{n_1 \times \dots \times n_d}$, index sets $(I_{\le k}, I_{>k+1})$ containing previous pivots.}
+\Ensure {New pivots $(i^*_{\le k}, i^*_{>k+1})$}
+\For {$1 \le k \le d-1$}
+\State Use~\cite[Algorithm 2]{dolgov2020parallel} to find $(i^*_{\le k}, i^*_{>k+1})$ on a superblock $X_k(I_{\le k-1}\times\mathbb{I}_k,\mathbb{I}_{k+1}\times I_{> k+1})$, which is seen as a submatrix of the $k$th unfolding of $\mathcal{X}$.
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\section{Subtensor parallelism for tensor-train cross approximation}
+\label{sec:subTTcross}
+\subsection{Submatrix parallelism for matrix cross approximation}
 There are various ways to compute a matrix low rank decomposition with cross approximation. For example,~\cite[Algorithm 2]{dolgov2020parallel} provides a scheme to find a new pivot for the approximation. In this section, we aim to extend this idea to distributed memory setting. In other words, our target is to make this algorithm parallelizable, so that we can use several processors to find the new pivot with efficiency and scalability.
 
 Suppose the matrix to be decomposed is $A$ and we have a 2D processor grid with $P = P_{\rm row}P_{\rm col}$ processors in total. Then, the processors can be labeled with $P_{k,\ell}$ with $1 \le k \le P_{\rm row}$ and $1 \le \ell \le P_{\rm col}$, which handles the submatrix $A_{k,\ell} = A(K,L)$. Here $K$ and $L$ are used to denote the row and column index sets that all processors on block row $k$ and block column $\ell$ handle respectively. If the row indices of the current selected pivots are stored in the set $I$, and column indices in $J$, then we know the matrix approximation at this step is 
@@ -202,8 +230,7 @@ which is essential in selecting the new pivots. Therefore, in addition to $A_{k,
 \end{algorithmic}   
 \end{algorithm}
 
-\section{Subtensor parallelism for tensor-train cross approximation}
-\label{sec:subTTcross}
+\section{Tensor-train cross approximation}
 The paper~\cite{dolgov2020parallel} introduces a parallel algorithm to compute tensor-train (TT) cross approximation that the parallelism is with respect to dimensionality. However, this type of parallelism has a limitation that when the tensor is low dimensional, then we cannot fully utilize the computing resources that we have. For example, when $d = 5$, then we can only use $\le 4$ MPI ranks for computation. Hence, we want to design a parallel TT cross approximation whose parallelism can allow us to allocate more processors.
 
 We use the idea from~\cite{shi2023parallel} to assign processors to deal with subtensors. Therefore, we want to introduce the same idea for parallel TT cross approximation.
