@@ -117,7 +117,7 @@ We implement our parallel algorithms with both distributed and shared memory par
 In this section, we review some tensor notations, the TT format for low rank tensor approximations, and some TT decomposition algorithms. Throughout this paper, we aim to obtain an approximation $\tilde{\mathcal{X}}$ with low TT ranks of a given tensor $\mathcal{X}$. Whenever possible, we further require the approximation satisfies~\cref{eq:FrobeniusNorm} for some $0 < \epsilon < 1$.
 
 \subsection{Tensor notation} \label{sec:notation}
-We use lower class letters for vectors, capital letters for matrices, and calligraphic capital letters for tensors. For notational simplicity, we use MATLAB-style notation to start index counting from 1, and the symbol ``:" in indexing. This includes using $a\!:\!b$ to represent the inclusive index set $\{a,a+1,\ldots,b\}$, and a single ``:" to represent all the indices in that dimension from start to end. For example, if $\mathcal{Y} \in \R^{4 \times 8 \times 10}$, then $\mathcal{Y}(:,4\!:\!6,:)$ denotes a subtensor of $\mathcal{Y}$ with size $4 \times 3 \times 10$. In addition, we use the simplified notation $A_k$ to represent the $k$th column of the matrix $A$ instead of $A(:,k)$. In this way, $(A^T)_\ell$ is used for the $\ell$th row of $A$. Finally, we use index sets for submatrix and subtensor selection. For example, $A(:,J)$ is a submatrix of $A$ with columns $A_j$ for all $j \in J$.
+We use lower class letters for vectors, capital letters for matrices, and calligraphic capital letters for tensors. For notational simplicity, we use MATLAB-style notation to start index counting from 1, and the symbol ``:" in indexing. This includes using $a\!:\!b$ to represent the inclusive index set $\{a,a+1,\ldots,b\}$, and a single ``:" to represent all the indices in that dimension from start to end. For example, if $\mathcal{Y} \in \R^{4 \times 8 \times 10}$, then $\mathcal{Y}(:,4\!:\!6,:)$ denotes a subtensor of $\mathcal{Y}$ with size $4 \times 3 \times 10$. In addition, we use the simplified notation $A_k$ to represent the $k$th column of the matrix $A$ instead of $A(:,k)$. In this way, $(A^T)_\ell$ is used for the $\ell$th row of $A$. Finally, we use index sets for submatrix and subtensor selection. For example, $A(:,\mathcal{J})$ is a submatrix of $A$ with columns $A_j$ for all $j \in \mathcal{J}$.
 
 In addition, we use the MATLAB command ``reshape" to form a new structure according to the multi-index via reorganizing elements without changing the element ordering. For example, if $\mathcal{Y} \in \C^{n_1 \times n_2 \times n_3}$, then $Z = {\rm reshape}(\mathcal{Y},n_1n_2,n_3)$ returns a matrix of size $n_1n_2 \times n_3$ formed by stacking entries, and similarly, $\mathcal{Y} = {\rm reshape}(Z,n_1,n_2,n_3)$. The command ``reshape" is essential when flattening a tensor into matrices, which we refer to as the unfoldings of a tensor. Tensor unfoldings are fundamental to the TT format, especially in developing practical TT decomposition algorithms and bounding TT ranks. For a tensor $\mathcal{X}\in\C^{n_1\times\cdots\times n_d}$, we denote the $k$th unfolding as
 \[X_k={\rm reshape}\left(\mathcal{X},\prod_{s=1}^k n_s,\prod_{s=k+1}^d n_s\right), \quad 1 \le k \le d-1.\]
@@ -182,46 +182,52 @@ In~\cite{shi2023parallel}, the authors use the property that column spaces of te
 
 \subsection{Pivot selection and dimension parallel TT cross}
 Algorithms based on SVD can be extremely expensive and unnecessary in many situations. For example, tensors originated from real world datasets are often large and sparse, and we often only want an approximation with an accuracy of a few significant digits. This leads to heuristic data-based methods, such as adaptive cross approximation (ACA). In summary, ACA mainly finds a ``skeleton" of original data for approximation. For example, the CUR factorization of a matrix in the form of
-\[ A \approx CUR = A(:,J)A(I,J)^{-1}A(I,:), \]
-where $I$ and $J$ are two index sets for selection. The key building block in ACA is new pivot selection to enrich the index sets. There are various metrics for selecting, but we focus on a greedy approach outlined in~\cite[Algorithm 2]{dolgov2020parallel}, which is computationally much cheaper than other routines such as max volume selection. Suppose we use $I_{\le k}$ and $I_{>k+1}$ to denote the selected sets of pivots for the $k$th unfolding of a tensor $\mathcal{X}$ and $\mathbb{I}_\ell$ to denote the set of all indices for dimension $\ell$ with $1 \le k \le d-1$ and $1 \le \ell \le d$, then one step of finding new pivots is described in~\cref{alg:TTcross}. Additionally, pivots selected this way can be shown to satisfy the nestedness property, which ensures that pivots found in one tensor unfolding can be carried over to subsequent unfoldings. As a result,~\cref{alg:TTcross} is automatically a dimension parallel algorithm.
+\[ A \approx CUR = A(:,\mathcal{J})A(\mathcal{I},\mathcal{J})^{-1}A(\mathcal{I},:), \]
+where $\mathcal{I}$ and $\mathcal{J}$ are two index sets for selection. The key building block in ACA is new pivot selection to enrich the index sets. There are various metrics for selecting, but we focus on a greedy approach outlined in~\cite[Algorithm 2]{dolgov2020parallel}, which is computationally much cheaper than other routines such as max volume selection. Suppose we use $\mathcal{I}_{\le k}$ and $\mathcal{I}_{>k+1}$ to denote the selected sets of pivots for the $k$th unfolding of a tensor $\mathcal{X}$ and $\mathbb{I}_\ell$ to denote the set of all indices for dimension $\ell$ with $1 \le k \le d-1$ and $1 \le \ell \le d$, then one step of finding new pivots is described in~\cref{alg:TTcross}. Notice that $\mathcal{I}_{\le 0}$ and $\mathcal{I}_{>d}$ here are empty sets. Additionally, pivots selected this way can be shown to satisfy the nestedness property, which ensures that pivots found in one tensor unfolding can be carried over to subsequent unfoldings. As a result,~\cref{alg:TTcross} is automatically a dimension parallel algorithm.
 
 \begin{algorithm}
 \caption{One step of finding new pivots in TT cross.}
 \begin{algorithmic}[1]
 \label{alg:TTcross}
-\Require {A tensor $\mathcal{X} \in \C^{n_1 \times \dots \times n_d}$, index sets $(I_{\le k}, I_{>k+1})$ containing previous pivots.}
+\Require {A tensor $\mathcal{X} \in \C^{n_1 \times \dots \times n_d}$, index sets $(\mathcal{I}_{\le k}, \mathcal{I}_{>k+1})$ containing previous pivots.}
 \Ensure {New pivots $(i^*_{\le k}, i^*_{>k+1})$}
 \For {$1 \le k \le d-1$}
-\State Use~\cite[Algorithm 2]{dolgov2020parallel} to find $(i^*_{\le k}, i^*_{>k+1})$ on a superblock $X_k(I_{\le k-1}\times\mathbb{I}_k,\mathbb{I}_{k+1}\times I_{> k+1})$, which is seen as a submatrix of the $k$th unfolding of $\mathcal{X}$.
+\State Use~\cite[Algorithm 2]{dolgov2020parallel} to find $(i^*_{\le k}, i^*_{>k+1})$ on a superblock $X_k(\mathcal{I}_{\le k-1}\times\mathbb{I}_k,\mathbb{I}_{k+1}\times \mathcal{I}_{> k+1})$, which is seen as a submatrix of the $k$th unfolding of $\mathcal{X}$.
 \EndFor
 \end{algorithmic}
 \end{algorithm}
 
-\section{Subtensor parallelism for tensor-train cross approximation}
+\section{Subtensor parallelism for TT decomposition}
 \label{sec:subTTcross}
-\subsection{Submatrix parallelism for matrix cross approximation}
-There are various ways to compute a matrix low rank decomposition with cross approximation. For example,~\cite[Algorithm 2]{dolgov2020parallel} provides a scheme to find a new pivot for the approximation. In this section, we aim to extend this idea to distributed memory setting. In other words, our target is to make this algorithm parallelizable, so that we can use several processors to find the new pivot with efficiency and scalability.
+In this section, we develop subtensor parallel TT decomposition algorithms suitable for the distributed memory framework. Throughout this section, we assume each mode size $n_j$ is partitioned evenly into $C_j$ pieces for $1 \le j \le d$. In this way, there are $C = \prod_{j=1}^d C_j$ subtensors in total with roughly the same size. For the moment, we suppose one processor handles one subtensor at a time. In order to clearly describe our distributed memory algorithm, we refer to some MPI functions for communication patterns. These include
+\begin{itemize}[leftmargin=*,noitemsep]
+\item \textit{Send}: The action of sending some information from one MPI rank to another.
+\item \textit{Receive}: The action of receiving the information sent by \textit{Send}.
+\item \textit{Allgather}: The action of collecting some information from all processors and storing them on each processor.
+\end{itemize}
 
-Suppose the matrix to be decomposed is $A$ and we have a 2D processor grid with $P = P_{\rm row}P_{\rm col}$ processors in total. Then, the processors can be labeled with $P_{k,\ell}$ with $1 \le k \le P_{\rm row}$ and $1 \le \ell \le P_{\rm col}$, which handles the submatrix $A_{k,\ell} = A(K,L)$. Here $K$ and $L$ are used to denote the row and column index sets that all processors on block row $k$ and block column $\ell$ handle respectively. If the row indices of the current selected pivots are stored in the set $I$, and column indices in $J$, then we know the matrix approximation at this step is 
-\[ \tilde{A} = A(:,J)A(I,J)^{-1}A(I,:). \]
-We can also find out the submatrices of $\tilde{A}$ are
-\[ \tilde{A}_{k,\ell} =  A(K,J)A(I,J)^{-1}A(I,L), \]
-which is essential in selecting the new pivots. Therefore, in addition to $A_{k,\ell}$, the processor $P_{k,\ell}$ also holds $A(K,J\backslash L)$ and $A(I \backslash K,L)$ to build $\tilde{A}_{k,\ell}$. This allows $\tilde{A}_{k,\ell}$ on each processor to be the same as if $\tilde{A}$ is built globally with all elements of $A$. In this way, suppose one finds a new pivot $(i^*,j^*)$ with starting random set $L$ globally on $A$ using Algorithm 2 in~\cite{dolgov2020parallel}, then the same pivot $(i^*,j^*)$ is guaranteed to be recovered on one of the submatrices if Algorithm 2 in~\cite{dolgov2020parallel} is performed on each processor and $L$ is a subset of the union of the starting random sets on each processor. After local pivots are found on each submatrix, the processors communicate to find the best pivot, and $P_{k,\ell}$ also needs to handle extra information $A(K,j^*)$ if $j^* \notin L$ and $A(i^*,L)$ if $i^* \notin K$. This distributed version of algorithm is described in Algorithm 1.
+\subsection{Submatrix parallel matrix cross approximation}
+\label{sec:submatrixCross}
+Firstly, we introduce submatrix parallel matrix cross, and later use the same idea to develop subtensor parallel tensor cross. Suppose the matrix to be decomposed is $A$ and it is partitioned into $C_1C_2$ submatrices, and we use $C_1C_2$ working processors labeled by $P_{k,\ell}$ for $1 \le k \le C_1$ and $1 \le \ell \le C_2$. If the row indices of the current selected pivots are stored in the set $\mathcal{I}$, and column indices in $\mathcal{J}$, then we know the matrix approximation at this step is 
+\[ \tilde{A} = A(:,\mathcal{J})A(\mathcal{I},\mathcal{J})^{-1}A(\mathcal{I},:), \]
+which is useful in finding new pivots with a matrix version of~\cref{alg:TTcross}. For a submatrix labeled by $(\mathcal{K},\mathcal{L})$, we can also find out that $\tilde{A}(K,L)$ can be represented as
+\[ \tilde{A}(\mathcal{K},\mathcal{L}) =  A(\mathcal{K},\mathcal{J})A(\mathcal{I},\mathcal{J})^{-1}A(\mathcal{I},\mathcal{L}). \]
+Therefore, if the processor $P_{k,\ell}$ holds $A(\mathcal{K},\mathcal{J}\backslash \mathcal{L})$ and $A(\mathcal{I} \backslash \mathcal{K},\mathcal{L})$ as well as $A(\mathcal{K},\mathcal{L})$, then it can build $\tilde{A}(\mathcal{K},\mathcal{L})$, and it is the same as the taking the submatrix from $\tilde{A}$ when $\tilde{A}$ is built globally with all elements of $A$. In this way, suppose one finds a new pivot $(i^*,j^*)$ with starting random set $L$ globally on $A$ in line 2 of~\cref{alg:TTcross}, then the same pivot $(i^*,j^*)$ is guaranteed to be recovered on one of the submatrices if one applies~\cref{alg:TTcross} individually to the subblocks and $L$ is a subset of the union of the starting random sets on each submatrix. Next, local pivots are communicated to find the best one. Finally, if $(i^*,j^*) \in A(\mathcal{K}^*,\mathcal{L}^*)$ with responsible processor $P_{k^*,\ell^*}$, then to prepare for the next iteration, we need the processor $P_{k,\ell}$ to handle extra information $A(\mathcal{K},j^*)$ if $\ell \neq \ell^*$ and $A(i^*,\mathcal{L})$ if $k \neq k^*$. The former and latter involve communications among processors on the same block row and column respectively. This distributed version of algorithm is described in~\cref{alg:submatrixCross}, with the assumption that one processor handles one submatrix.
 
 \begin{algorithm}
 \caption{One step of the matrix cross interpolation algorithm on one processor.}
 \begin{algorithmic}[1]
-\label{alg:1}
-\Require {Matrix $A$ to be decomposed, sets $(\mathcal{I},\mathcal{J})$ containing existing pivots, sets $(\mathcal{K},\mathcal{L})$ containing indices of submatrices handled by this processor.}
+\label{alg:submatrixCross}
+\Require {Sets $(\mathcal{I},\mathcal{J})$ containing existing pivots, sets $(\mathcal{K},\mathcal{L})$ containing indices of submatrices handled by this processor, and matrix elements $A(\mathcal{I},\mathcal{J}\cup\mathcal{L})$ and $A(\mathcal{I}\cup\mathcal{K},\mathcal{J})$.}
 \Ensure {A new pivot $(i^*,j^*)$ for $A$.}
-\State Perform Algorithm 2 in~\cite{dolgov2020parallel} on $A(\mathcal{K},\mathcal{L})$ to get a local pivot $(i^*_p,j^*_p)$.
+\State Perform~\cref{alg:TTcross} on $A(\mathcal{K},\mathcal{L})$ to get a local pivot $(i^*_p,j^*_p)$.
 \State Use \textit{Allgather} to find the best pivot $(i^*,j^*)$ on all processors.
-\If $j^* \in \mathcal{L}$
+\If {$j^* \in \mathcal{L}$}
 \State \textit{Send} $A(\mathcal{K},j^*)$ to all processors that deal with row index set $\mathcal{K}$.
 \Else
 \State \textit{Receive} $A(\mathcal{K},j^*)$ from the processor that contains this data.
 \EndIf
-\If $i^* \in \mathcal{K}$
+\If {$i^* \in \mathcal{K}$}
 \State \textit{Send} $A(i^*,\mathcal{L})$ to all processors that deal with column index set $\mathcal{L}$.
 \Else
 \State \textit{Receive} $A(i^*,\mathcal{L})$ from the processor that contains this data.
@@ -230,30 +236,29 @@ which is essential in selecting the new pivots. Therefore, in addition to $A_{k,
 \end{algorithmic}   
 \end{algorithm}
 
-\section{Tensor-train cross approximation}
-The paper~\cite{dolgov2020parallel} introduces a parallel algorithm to compute tensor-train (TT) cross approximation that the parallelism is with respect to dimensionality. However, this type of parallelism has a limitation that when the tensor is low dimensional, then we cannot fully utilize the computing resources that we have. For example, when $d = 5$, then we can only use $\le 4$ MPI ranks for computation. Hence, we want to design a parallel TT cross approximation whose parallelism can allow us to allocate more processors.
+\subsection{Subtensor TT cross approximation}
+Since cross approximation for the TT format requires pivots regarding each dimension, we aim to discover pivots with the nestedness property, so that the approximation generated by~\cref{alg:TTcross} recovers the exact same elements of the original tensor on positions $(\mathcal{I}_{\le k-1},\mathbb{I}_k,\mathcal{I}_{>k+1})$. Mathematically, the nestedness of the pivots can be represented as
+\begin{equation} \label{eq:nestedpivots}
+\mathcal{I}_{\le k+1} \subset \mathcal{I}_{\le k} \times \mathbb{I}_{k+1}, \quad \mathcal{I}_{>k} \subset \mathcal{I}_{>k+1} \times \mathbb{I}_{k+1},
+\end{equation}
+for $1 \le k \le d-1$. In subtensor parallelism, we hope to maintain this nestedness so that running~\cref{alg:TTcross} preserves interpolation on the entire tensor.
 
-We use the idea from~\cite{shi2023parallel} to assign processors to deal with subtensors. Therefore, we want to introduce the same idea for parallel TT cross approximation.
-
-Suppose we have a tensor $\mathcal{X} \in \R^{n_1 \times \cdots \times n_d}$ and an index partitioning $P_1 \times \cdots \times P_d$ so there are $P = |P_1|\cdot\dots\cdot|P_d|$ subtensors in total, and we denote each index by $P_1^{(j)} \times \cdots \times P_d^{(j)}$ where $1 \le j \le P$. As the dimensionality parallel algorithm in~\cite{dolgov2020parallel}, we develop the new parallel algorithm based on Algorithm 5. For notational simplicity, we follow those used in~\cite{dolgov2020parallel} and let $I_{\le 1}, \dots, I_{\le d-1}, I_{>2}, \dots, I_{>d-1}$ to denote the selected subsets for the tensor unfoldings $X_1, \dots, X_{d-1}$, and $\mathbb{I}_1,\dots,\mathbb{I}_d$ to denote the set of all indices for each dimension.
-
-In Algorithm 5, the main parallelized procedure is to find a new pivot on the superblock 
-\[ X(I_{\le k-1}\times\mathbb{I}_k,\mathbb{I}_{k+1}\times I_{>k+1}), \] 
-which is seen as a $r_{k-1}n_k \times n_{k+1}r_{k+1}$ matrix. In subtensor parallelism, we define 
-\[ J_{\le 1}^{(j)} = I_{\le 1} \cap P_1^{(j)}, \quad J_{\le 2}^{(j)} = I_{\le 2} \cap (P_1^{(j)} \times P_2^{(j)}), \quad\dots, \] 
-to indicate the set of indices in $I_{\le 1}, I_{\le 2}, \dots$ that are handled by the subtensor. Similarly we can define $J_{> 2}^{(j)},\dots$. In addition, it's straightforward to see that 
-\[ P_1^{(j)} = \mathbb{I}_1 \cap P_1^{(j)}, \quad P_2^{(j)} = \mathbb{I}_2 \cap P_2^{(j)},\quad \dots. \].
-
-In this way, we can replace $I_{\le k-1}\times\mathbb{I}_k$ by $J_{\le k-1}^{(j)}\times P_k^{(j)}$ and $\mathbb{I}_{k+1}\times I_{>k+1}$ by $P_{k+1}^{(j)}\times J_{>k+1}^{(j)}$ to represent the new set of indices significant in this subtensor. For this algorithm to work, the remaining question is to show that the set $J_{\le k}^{(j)}$ satisfy the nestedness property:
+To see this, for a $d$-dimensional tensor, we first define $(\mathcal{K}_1^{(c)},\dots,\mathcal{K}_d^{(c)})$ to denote the index sets of any subtensor, for $1 \le c \le C$. Then, the sets of pivots on this subtensor can be represented as
+\[ \mathcal{J}_{\le 1}^{(c)} = \mathcal{I}_{\le 1} \cap \mathcal{K}_1^{(c)}, \quad \mathcal{J}_{\le 2}^{(c)} = \mathcal{I}_{\le 2} \cap (\mathcal{K}_1^{(c)} \times \mathcal{K}_2^{(c)}), \quad\cdots, \] 
+and similarly for $\mathcal{J}_{> 1}^{(c)}$ and etc.. In addition, it's straightforward to see that 
+\[ \mathcal{K}_1^{(c)} = \mathbb{I}_1 \cap \mathcal{K}_1^{(c)}, \quad \mathcal{K}_2^{(c)} = \mathbb{I}_2 \cap \mathcal{K}_2^{(c)},\quad \cdots. \].
+In this way, the nestedness property on each subtensor can be translated as:
 \begin{align*}
-J_{\le k}^{(j)} &= I_{\le k} \cap \left(P_1^{(j)} \times\cdots\times P_k^{(j)}\right) \\
-&\subset (I_{\le k-1} \times \mathbb{I}_k) \cap \left(P_1^{(j)} \times\cdots\times P_k^{(j)}\right) \\
-&\subset \left[I_{\le k-1} \cap \left(P_1^{(j)} \times\cdots\times P_{k-1}^{(j)}\right)\right] \times \left( \mathbb{I}_k \cap P_k^{(j)}\right) \\
-&= J_{\le k-1}^{(j)} \times P_k^{(j)}.
+\mathcal{J}_{\le k}^{(c)} &= \mathcal{I}_{\le k} \cap \left(\mathcal{K}_1^{(c)} \times\cdots\times \mathcal{K}_k^{(c)}\right) \\
+&\subset (\mathcal{I}_{\le k-1} \times \mathbb{I}_k) \cap \left(\mathcal{K}_1^{(c)} \times\cdots\times \mathcal{K}_k^{(c)}\right) \\
+&\subset \left[\mathcal{I}_{\le k-1} \cap \left(\mathcal{K}_1^{(c)} \times\cdots\times \mathcal{K}_{k-1}^{(c)}\right)\right] \times \left( \mathbb{I}_k \cap \mathcal{K}_k^{(c)}\right) \\
+&= \mathcal{J}_{\le k-1}^{(c)} \times \mathcal{K}_k^{(c)}.
 \end{align*}
-Therefore, we have nestedness guarantee of the subtensor parallel algorithm. This means that each subtensor can find its own new pivots for each superblock, and we need to communicate between subtensors to obtain the best new pivots for the superblocks.
+Using the similar argument, we can show $\mathcal{J}_{>k}^{(c)} \subset \mathcal{J}_{>k+1}^{(c)} \times \mathcal{K}_{k+1}^{(c)}$ as well. These provide nestedness guarantee of the subtensor parallel algorithm. As a result, the global best pivots can be thus obtained as the best of the local pivots on each subtensor.
 
-\section{Processor grid development for parallel tensor-train algorithms}
+At last, we can combine~\cref{alg:TTcross} and~\cref{alg:submatrixCross} to develop subtensor TT cross, since superblocks in line 2 of~\cref{alg:TTcross} can be partitioned into submatrices according to subtensor partitioning. One only needs to pay attention to the extra information each processor needs to have access to, in order to discover good-quality pivots as discussed in~\cref{sec:submatrixCross}.
+
+\section{Processor grid development for subtensor TT algorithms}
 \label{sec:subComm}
 Processor grids are often used in distributed memory programming for easier analysis of local computation and communication costs. The idea of 1D and 2D processor grids are widely adopted in numerical linear algebra, especially for vectors and matrices. In this section, we aim to use processor grids for parallel TT algorithms, mainly for TT sketching and TT cross.
 
