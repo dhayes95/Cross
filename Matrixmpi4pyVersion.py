@@ -5,7 +5,6 @@ import numpy as np
 import time
 import random
 from mpi4py import MPI
-import matplotlib.pyplot as plt
 import sys
 import itertools
 
