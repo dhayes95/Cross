@@ -14,4 +14,4 @@ vpkg_require openmpi/4.1.0 python
 
 source ./subten-mpi-env/bin/activate
 
-mpirun python MPIOptimized.py 50,50,50 10,10 2,2,2 100
+mpirun python SubtensorTTCrossMPI.py 50,50,50 10,10 2,2,2 100
