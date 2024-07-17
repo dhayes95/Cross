@@ -5,8 +5,8 @@ The file included in this folder titled "MPISubtensorTTCross.py" is a self conta
 # Description of the code
 
 The provided python code is split into two main parts:
-1 - The custom built functions which go from lines 25 - 1370
-2 - The implementation of the algorithm which goes from lines 1374 - 2088
+* 1 - The custom built functions which go from lines 25 - 1370
+* 2 - The implementation of the algorithm which goes from lines 1374 - 2088
 
 Functions in part 1 include items such as index specific functions, greedy pivot search functions, and functions pertaining to actions at the tensor level such as entrywise computation, unfoldings, and superblock constructions.
 
