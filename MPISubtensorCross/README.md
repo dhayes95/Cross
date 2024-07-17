@@ -29,6 +29,9 @@ Below is an example of a the setup to run a 4D Maxwellian tensor of size [800,40
 * Uncomment lines 33 and 41 of "MPISubtensorTTCross.py"
 * execute the command mpirun -n 64 MPISubtensorTTCross.py 100000 10 800,400,800,400 10,5,20 1,8,8,1 1,8,8,1
 
+If you wish to test over all available partitions using 64 MPI ranks with two dimensions partitioned into 8 intervals, the command now becomes
+* mpirun -n 64 MPISubtensorTTCross.py 100000 10 800,400,800,400 10,5,20 1,1,1,1 1,8,8,1
+
 
 
 
