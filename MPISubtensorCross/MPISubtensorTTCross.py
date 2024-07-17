@@ -10,8 +10,8 @@ from decimal import Decimal
 from mpi4py import MPI
 import sys
 decimal.getcontext().prec=10000
-import os
-os.environ['OPENBLAS_NUM_THREADS'] = '1'
+
+
 
 ####################################################################
 ################Settings for results in paper#######################
@@ -26,7 +26,7 @@ def Local_subtensor_construction(bounds,sub_dim):
 
     #Computes the local subtensors:
     # inputs do not need to change, only change the function below in line 13 and 19.
-    subtensor = np.fromfunction(lambda i0,i1,i2: (1)/(1+i0+bounds[0][0]+i1+bounds[1][0]+i2+bounds[2][0]),sub_dim)
+    #subtensor = np.fromfunction(lambda i0,i1,i2: (1)/(1+i0+bounds[0][0]+i1+bounds[1][0]+i2+bounds[2][0]),sub_dim)
     #subtensor = np.fromfunction(lambda i0,i1,i2,i3: (1)/(1+i0+bounds[0][0]+i1+bounds[1][0]+i2+bounds[2][0]+i3+bounds[3][0]),sub_dim)
     #subtensor = np.fromfunction(lambda i0,i1,i2,i3,i4: (1)/(1+i0+bounds[0][0]+i1+bounds[1][0]+i2+bounds[2][0]+i3+bounds[3][0]+i4+bounds[4][0]),sub_dim)
     #subtensor = np.fromfunction(lambda i0,i1,i2,i3,i4,i5: (1)/(1+i0+bounds[0][0]+i1+bounds[1][0]+i2+bounds[2][0]+i3+bounds[3][0]+i4+bounds[4][0]+i5+bounds[5][0]),sub_dim)
@@ -37,7 +37,7 @@ def Local_subtensor_construction(bounds,sub_dim):
 
 def tensor_entry(index):
 
-    value = 1/(sum(index)+1)
+    #value = 1/(sum(index)+1)
     #value = Maxwellian2d2v(index[0],index[1],index[2],index[3],dims)
     #value = Maxwellian3d3v(index[0],index[1],index[2],index[3],index[4],index[5],dims)
 
