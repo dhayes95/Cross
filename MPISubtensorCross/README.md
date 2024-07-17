@@ -1,4 +1,4 @@
-# Distributed memory subtensor parallel TT-Cross
+# DISTRIBUTED MEMORY PARALLEL ADAPTIVE TENSOR-TRAIN CROSS APPROXIMATION - Authors: Tianyi Shi, Daniel Hayes, Jingmei Qiu
 
 The file included in this folder titled "MPISubtensorTTCross.py" is a self contained files that will automaticall load numpy, math, and mpi4py. All other functions used are included before the main body of the file begins.
 
