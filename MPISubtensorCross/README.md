@@ -6,7 +6,7 @@ The file included in this folder titled "MPISubtensorTTCross.py" is a self conta
 
 The provided python code is split into two main parts:
 * 1 - The custom built functions which go from lines 25 - 1370
-* 2 - The implementation of the algorithm which goes from lines 1374 - 2088
+* 2 - The implementation of the algorithm which goes from lines 1374 - 2053
 
 Functions in part 1 include items such as index specific functions, greedy pivot search functions, and functions pertaining to actions at the tensor level such as entrywise computation, unfoldings, and superblock constructions.
 
@@ -22,15 +22,12 @@ In order to run the code, it can be run through command line arguments, or sbatc
   * Input 2: Number of test runs that the algorithm will be tested on
   * Input 3: Tensor dimension as a comma separated seqence of numbers, e.g., 50,35,40,26 would correspond to a 4D tensor of size [50,35,40,26]
   * Input 4: Internal core ranks as a comma separated sequence of numbers, e.g., 15,17,9 would correspond to a TT-Cross approximation of a 4D tensor with core ranks (1,15,17,9,1)
-  * Input 5: List of required partition structure as a comma separated sequence of numbers, e.g., 1,2,1,1 would require any partition to be a refinement of the partition 1,2,1,1
-  * Input 6: List(s) of unordered partition values as a comma separated sequence of numbers, e.g. 1,1,2,2 1,1,1,4 would run all combinations of partitions in which either two     dimensions are partitioned into two intervals, or one dimension is partitioned into 4 intervals provided they are a refinement of Input 5. Note: if a specific partition is to be run, set Input 5 and Input 6 to the same desired partition list.
+  * Input 5: List of required partition structure as a comma separated sequence of numbers, e.g., 1,2,1,1 would partition the second dimension into two intervals.
  
 Below is an example of a the setup to run a 4D Maxwellian tensor of size [800,400,800,400] with TT core ranks (1,10,5,20,1) on a partition of (1,8,8,1) over 10 test runs with 100000 error samples
 * Uncomment lines 33 and 41 of "MPISubtensorTTCross.py"
-* execute the command mpirun -n 64 MPISubtensorTTCross.py 100000 10 800,400,800,400 10,5,20 1,8,8,1 1,8,8,1
+* execute the command mpirun -n 64 MPISubtensorTTCross.py 100000 10 800,400,800,400 10,5,20 1,8,8,1 
 
-If you wish to test over all available partitions using 64 MPI ranks with two dimensions partitioned into 8 intervals, the command now becomes
-* mpirun -n 64 MPISubtensorTTCross.py 100000 10 800,400,800,400 10,5,20 1,1,1,1 1,8,8,1
 
 
 
