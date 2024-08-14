@@ -1385,24 +1385,19 @@ if __name__ == "__main__":
     #Collect the inputs
     dims = list(map(int,sys.argv[3].split(",")))
     partitions = [1 for _ in range(len(dims))]
-    #rs = list(map(int,sys.argv[4].split(",")))
     err_sample_size = int(float(sys.argv[1]))
-    pparts = [list(map(int,sys.argv[p].split(","))) for p in range(6,len(sys.argv))]
     number_trial = int(sys.argv[2])
-    prev_grid = list(map(int,sys.argv[5].split(",")))
-    pp = []
-    pp = [pp + list(set(itertools.permutations(pparts[l]))) for l in range(len(pparts))]
-    pp = [x for y in pp for x in y]
+    grid = list(map(int,sys.argv[5].split(",")))
     
-    
-
-    pp_i = [pp[i] for i in range(len(pp)) if all([pp[i][j]%prev_grid[j] ==0 for j in range(len(prev_grid))])]
-
-    pp_order = np.argsort([np.max([dims[i]/pp_i[j][i] for i in range(len(dims))]) for j in range(len(pp_i))])
-    pp_f = [pp_i[pp_order[i]] for i in range(len(pp_i))]
+    check = [dims[i]//grid[i] for i in range(len(dims))]
+    if np.min(check)>2:
+        pp_f = [grid]
+    else:
+        pp_f = []
     
     if len(pp_f)==0:
-        print('No partition available')
+        print('Not valid partition, reduce grid size')
+    
     else:
         for processor_partition in pp_f:
             
