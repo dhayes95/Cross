@@ -1849,15 +1849,20 @@ if __name__ == "__main__":
                             dispatch.append(np.round(val).astype(int))
                     
                     #This form will do a strict processor grid allocation
-                    #dispatch = [np.prod(processor_partition[:i+1]).astype(int) for i in range(len(dims)-1)]
-                    #dispatch = [1 for i in range(len(dims)-1)]
-                    dispatch = np.array_split(np.linspace(0,np.max([np.min([world_size,len(dims)-1]),math.prod(processor_partition)])-1,np.max([np.min([world_size,len(dims)-1]),math.prod(processor_partition)])).astype(int),len(dims)-1)
-                    dispatch = [len(dispatch[i]) for i in range(len(dispatch))]
                     
-                    rank_assignment = [np.linspace(0,dispatch[i]-1,dispatch[i]).astype(int) for i in range(len(dims)-1)]
-                    
-                    for i in range(1,len(rank_assignment)):
-                        rank_assignment[i]+=np.max(rank_assignment[i-1])+1
+                    if world_size>=len(dims)-1:
+                        dispatch = np.array_split(np.linspace(0,np.max([np.min([world_size,len(dims)-1]),math.prod(processor_partition)])-1,np.max([np.min([world_size,len(dims)-1]),math.prod(processor_partition)])).astype(int),len(dims)-1)
+                        dispatch = [len(dispatch[i]) for i in range(len(dispatch))]
+                        
+                        rank_assignment = [np.linspace(0,dispatch[i]-1,dispatch[i]).astype(int) for i in range(len(dims)-1)]
+                        
+                        for i in range(1,len(rank_assignment)):
+                            rank_assignment[i]+=np.max(rank_assignment[i-1])+1
+                        
+                    else:
+                        dispatch = [1 for i in range(len(dims)-1)]
+                        ph = list(np.round(np.linspace(0,world_size-1,len(dims)-1)).astype(int))
+                        rank_assignment = [[ph[i]] for i in range(len(ph))]
                     
                 if color!=10:
                     dispatch = None
@@ -1982,71 +1987,76 @@ if __name__ == "__main__":
                                                 loc_row_indx.append(i - bounds_core[l][0][0])
                                     for i in range(len(rank_assignment[j])):
                                         temp.append([col_split[i],row_selx,local_ranks,loc_row_indx,rank_assignment[j],rank_assignment[j][i]])
-                                    
+                temp_cols = []                  
                 if world_rank==0:
                     
                     for i in range(len(temp)):
                         if temp[i][-1]!=0:
                             world_comm.send(temp[i],dest = temp[i][-1],tag = 999)
                         else:
-                            local_cols = temp[i]
-                if world_rank!=0 and world_rank<sum(dispatch):
+                            temp_cols.append(temp[i])
+                            
+                if world_rank!=0 and world_rank<=np.max([x for y in rank_assignment for x in y]):#sum(dispatch):
+                    #print(rank_assignment.count([1]))
+                    ph = [x for y in rank_assignment for x in y]
+                    for _ in range(ph.count(world_rank)):
+                        temp_cols.append(world_comm.recv(source = 0,tag = 999))
                     
-                    local_cols = world_comm.recv(source = 0,tag = 999)
                 
-                if world_rank < sum(dispatch):
+                if world_rank<=np.max([x for y in rank_assignment for x in y]):#sum(dispatch):
                     
                     ########local_cols[4] give processor allocation per core (who can communicate with who for Tk construction)
                     ########local_cols[3] gives local row indices for selection
                     ########local_cols[2] gives rank in which each row is located
                     ########local_cols[1] gives the order of selection of indices in local_cols[3]
-
-                    #Fix ordering issue
-                    new_order = list(np.linspace(0,len(local_cols[1])-1,len(local_cols[1])).astype(int))#[local_cols[1].index(i) for i in range(len(local_cols[1]))]
-                    
-                    #Kick start
-                    #First give all the necessary submatrix A(I,J) 
-                    indicator = [local_cols[3][i] for i in range(len(local_cols[2])) if local_cols[2][new_order[i]]==world_rank]
-                    loc_submatrix=np.zeros((len(local_cols[3]),local_cols[0].shape[1]))
-                    placement = [i for i in range(len(local_cols[2])) if local_cols[2][new_order[i]]==world_rank]
-                    loc_submatrix[placement,:] = local_cols[0][indicator,:]
-                    
-
-                    for i in local_cols[4]:
-                        if i!=world_rank:
-                            world_comm.send([local_cols[0][indicator,:],placement],dest = i,tag = 34)
-                    for i in local_cols[4]:
-                        if i!=world_rank:
-                            placehold = world_comm.recv(source = i,tag = 34)
-                            loc_submatrix[placehold[1],:] = placehold[0]
-                    if world_rank == local_cols[2][new_order[0]]:
-                        scale_value = 1/local_cols[0][local_cols[3][new_order[0]],0]
+                    for local_cols in temp_cols:
+                        #Fix ordering issue
+                        new_order = list(np.linspace(0,len(local_cols[1])-1,len(local_cols[1])).astype(int))#[local_cols[1].index(i) for i in range(len(local_cols[1]))]
+                        
+                        #Kick start
+                        #First give all the necessary submatrix A(I,J) 
+                        indicator = [local_cols[3][i] for i in range(len(local_cols[2])) if local_cols[2][new_order[i]]==world_rank]
+                        loc_submatrix=np.zeros((len(local_cols[3]),local_cols[0].shape[1]))
+                        placement = [i for i in range(len(local_cols[2])) if local_cols[2][new_order[i]]==world_rank]
+                        loc_submatrix[placement,:] = local_cols[0][indicator,:]
+                        
+                        #tt1 = MPI.Wtime()
                         for i in local_cols[4]:
                             if i!=world_rank:
-                                world_comm.send(scale_value,dest = i,tag = 24)
-                    if world_rank!=local_cols[2][new_order[0]]:
-                        scale_value = world_comm.recv(source = local_cols[2][new_order[0]],tag = 24)
-                    Tk_local = scale_value * local_cols[0][:,[0]]
-                    
-
-                    #Finish process
-                    #First build Sk
-                    for j in range(1,len(local_cols[2])):
-                        Sk = Tk_local@loc_submatrix[:j,:][:,[j]] - local_cols[0][:,[j]]
-                        if world_rank == local_cols[2][new_order[j]]:
-                            scale_valueinv = Sk[local_cols[3][new_order[j]],0]
-                            scale_value = -1/scale_valueinv if scale_valueinv!=0 else 0
-                            ext = Tk_local[[local_cols[3][new_order[j]]],:]
+                                world_comm.send([local_cols[0][indicator,:],placement],dest = i,tag = 34)
+                        for i in local_cols[4]:
+                            if i!=world_rank:
+                                placehold = world_comm.recv(source = i,tag = 34)
+                                loc_submatrix[placehold[1],:] = placehold[0]
+                        if world_rank == local_cols[2][new_order[0]]:
+                            scale_value = 1/local_cols[0][local_cols[3][new_order[0]],0]
                             for i in local_cols[4]:
                                 if i!=world_rank:
                                     world_comm.send(scale_value,dest = i,tag = 24)
-                                    world_comm.send(ext,dest = i,tag = 24)
-                        if world_rank!=local_cols[2][new_order[j]]:
-                            scale_value = world_comm.recv(source = local_cols[2][new_order[j]],tag = 24)
-                            ext = world_comm.recv(source = local_cols[2][new_order[j]],tag = 24)
+                        if world_rank!=local_cols[2][new_order[0]]:
+                            scale_value = world_comm.recv(source = local_cols[2][new_order[0]],tag = 24)
+                        Tk_local = scale_value * local_cols[0][:,[0]]
+                        
 
-                        Tk_local = np.concatenate((Tk_local+scale_value*Sk@ext,-scale_value*Sk),axis = 1)
-                    
+                        #Finish process
+                        #First build Sk
+                        tt2 = MPI.Wtime()
+                        for j in range(1,len(local_cols[2])):
+                            Sk = Tk_local@loc_submatrix[:j,:][:,[j]] - local_cols[0][:,[j]]
+                            if world_rank == local_cols[2][new_order[j]]:
+                                scale_valueinv = Sk[local_cols[3][new_order[j]],0]
+                                scale_value = -1/scale_valueinv if scale_valueinv!=0 else 0
+                                ext = Tk_local[[local_cols[3][new_order[j]]],:]
+                                for i in local_cols[4]:
+                                    if i!=world_rank:
+                                        world_comm.send(scale_value,dest = i,tag = 24)
+                                        world_comm.send(ext,dest = i,tag = 24)
+                            if world_rank!=local_cols[2][new_order[j]]:
+                                scale_value = world_comm.recv(source = local_cols[2][new_order[j]],tag = 24)
+                                ext = world_comm.recv(source = local_cols[2][new_order[j]],tag = 24)
+
+                            Tk_local = np.concatenate((Tk_local+scale_value*Sk@ext,-scale_value*Sk),axis = 1)
+                        #print([world_rank,MPI.Wtime() - tt1,MPI.Wtime() - tt2])
                     
                 final_time = MPI.Wtime()
                 if world_rank==0:
@@ -2106,10 +2116,6 @@ if __name__ == "__main__":
                 print('*'*65)
                 print('Size', dims)
                 print('*'*65)
-        if world_rank==0:
-            print('Pivot time',np.min(pivot_times_list),pp_f[np.argmin(pivot_times_list)//number_trial])
-            print('core time',np.min(core_times_list),pp_f[np.argmin(core_times_list)//number_trial])
-            
   
             
                 
