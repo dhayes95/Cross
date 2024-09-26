@@ -496,7 +496,7 @@ def Low_access_MPICrossInterpSingleItemSuperPivV2(tensor_entries,At,bounds,X_dic
     if k==0:
         #Ii,Jj,p = Greedy_Pivot_Search_Piv(A,Ir[0],Ic[0])
         Ii,Jj,p,ps,X_dict = Low_Access_MPIGreedy_Search_PivV2(tensor_entries,At, Ir[k], Ic[k],[0],FIc[1],k,Xsize,bounds,X_dict)
-        if Ii[-1] not in Ir[0] or Jj[-1] not in Ic[0]:
+        if Ii[-1] not in Ir[0] and Jj[-1] not in Ic[0]:
             Ir[0] = np.append(Ir[0],Ii[-1]).astype(int)
             Ic[0] = np.append(Ic[0],Jj[-1]).astype(int)
             #print(Ir[0],Ic[0])
@@ -513,7 +513,7 @@ def Low_access_MPICrossInterpSingleItemSuperPivV2(tensor_entries,At,bounds,X_dic
     elif k==len(Xsize)-2:
         #Ii,Jj,p = Greedy_Pivot_Search_Piv(A,Ir[k],Ic[k]) 
         Ii,Jj,p,ps,X_dict = Low_Access_MPIGreedy_Search_PivV2(tensor_entries,At, Ir[k], Ic[k],FIr[-2],[0],k,Xsize,bounds,X_dict)
-        if Ii[-1] not in Ir[k] or Jj[-1] not in Ic[k]:
+        if Ii[-1] not in Ir[k] and Jj[-1] not in Ic[k]:
             Ir[k] = np.append(Ir[k],Ii[-1]).astype(int)
             Ic[k] = np.append(Ic[k],Jj[-1]).astype(int)
             if len(Ir[-2])>0:
@@ -529,7 +529,7 @@ def Low_access_MPICrossInterpSingleItemSuperPivV2(tensor_entries,At,bounds,X_dic
     else:
         #Ii,Jj,p = Greedy_Pivot_Search_Piv(A,Ir[k],Ic[k])
         Ii,Jj,p,ps,X_dict = Low_Access_MPIGreedy_Search_PivV2(tensor_entries,At, Ir[k], Ic[k],FIr[k-1],FIc[k+1],k,Xsize,bounds,X_dict)
-        if Ii[-1] not in Ir[k] or Jj[-1] not in Ic[k]:
+        if Ii[-1] not in Ir[k] and Jj[-1] not in Ic[k]:
             Ir[k] = np.append(Ir[k],Ii[-1]).astype(int)
             Ic[k] = np.append(Ic[k],Jj[-1]).astype(int)
             #print(Ir[k][-1], Ic[k][-1], FIr[k-1], FIc[k+1])
@@ -1761,7 +1761,11 @@ if __name__ == "__main__":
                         local_piv_value = comm.allgather(piv_vals)
 
                         active_piv_value = [local_piv_value[i][0] for i in active_ranks]
-                        selection[j].append(active_ranks[np.argmax(np.abs([active_piv_value[i] for i in range(len(active_ranks))]))])
+                        #selection[j].append(active_ranks[np.argmax(np.abs([active_piv_value[i] for i in range(len(active_ranks))]))])
+                        if any([active_piv_value[i] for i in range(len(active_ranks))]):
+                            selection[j].append(active_ranks[np.argmax(np.abs([active_piv_value[i] for i in range(len(active_ranks))]))])
+                        
+                        
                         row,col = Subtensor_Comm(selection[j][-1],shifting_p,j)
                         
                         #Send out information required to alter the index sets      
