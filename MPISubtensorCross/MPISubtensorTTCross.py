@@ -40,7 +40,7 @@ def tensor_entry(index):
     #value = 1/(sum(index)+1)
     #value = Maxwellian2d2v(index[0],index[1],index[2],index[3],dims)
     #value = Maxwellian3d3v(index[0],index[1],index[2],index[3],index[4],index[5],dims)
-
+    
     return value
 
 def tensor_entries(tensor_entry,indices,bounds):
@@ -52,8 +52,6 @@ def tensor_entries_glob(indices):
     #shift_inds = [[indices[j][i]+bounds[i][0] for i in range(len(indices[j]))] for j in range(len(indices))]
     values = [tensor_entry(indices[j]) for j in range(len(indices))]
     return values
-
-
 
 def Maxwellian2d2v(x_ind,vx_ind,y_ind,vy_ind,dim):
     
@@ -715,7 +713,7 @@ def Low_Access_MPIGreedy_Search_PivV2(tensor_entries,At,I,J,I_l,J_u,k,X_dim,boun
         J_new - Enriched column indices
     
     """
-    dim = [Ej.shape[0],Ei.shape[1]]
+    dim = At.shape
     
 
     #Check if I and J are empty
@@ -837,8 +835,19 @@ def Low_Access_MPIGreedy_Search_PivV2(tensor_entries,At,I,J,I_l,J_u,k,X_dim,boun
                 p = np.abs(err_1[sel_i])
                 p_sign = np.sign(err_1[sel_i])
             else:
-                I_new = I
-                J_new = J
+                #I_new = I
+                #J_new = J
+                I_out = np.delete(np.arange(dim[0]),I)
+                #ind_i,ind_j  =Large_unravel(np.argmax(np.abs((A - Atilde)[I_out,:])),[len(I_out),dim[1]])
+                ind_i = I_out[0]
+                #i_star = I_out[ind_i]
+                I_new = np.append(I,i_star)
+                J_out = np.delete(np.arange(dim[1]),J)
+                #ind_i,ind_j = Large_unravel(np.argmax(np.abs((A - Atilde)[:,J_out])),[dim[0],len(J_out)])
+                ind_j = J_out[0]
+                #j_star = J_out[ind_j]
+                #I_new = I
+                J_new = np.append(J,j_star)
                 p=0
                 p_sign = 1
         
@@ -1390,7 +1399,7 @@ if __name__ == "__main__":
     grid = list(map(int,sys.argv[5].split(",")))
     
     check = [dims[i]//grid[i] for i in range(len(dims))]
-    if np.min(check)>2:
+    if np.min(check)>=2:
         pp_f = [grid]
     else:
         pp_f = []
@@ -1543,9 +1552,10 @@ if __name__ == "__main__":
                     counter = [1 for _ in range(len(dims)-1)]
                     tracker = 0
                     for j in sweeps:
-                        
                         active_ranks = []  
                         active = 0
+                        search_ranks = []
+                        search = 0
 
                         ##################### LINES 641 - 665 DETERMINE THE ACTIVE RANKS #####################
                         ############## LOCAL SUPERBLOCKS AND APPROXIMATIONS ARE FORMED/ALLOCATED #############
@@ -1553,12 +1563,18 @@ if __name__ == "__main__":
                         if j==0:
                             if len(I_col_local[0][1])>0:
                                 active = 1
+                                if sub_dim[j]>len(I_row_local[0][j]) and len(I_col_local[0][j+1])*sub_dim[j+1]>len(I_col_local[0][j]):
+                                    search = 1
                         elif j==len(dims)-2:
                             if len(I_row_local[0][j-1])>0:
                                 active = 1
+                                if len(I_row_local[0][j-1])*sub_dim[j]>len(I_row_local[0][j]) and sub_dim[j+1]>len(I_col_local[0][j]):
+                                    search = 1
                         else:
                             if len(I_row_local[0][j-1])>0 and len(I_col_local[0][j+1])>0:
                                 active=1  
+                                if len(I_row_local[0][j-1])*sub_dim[j]>len(I_row_local[0][j]) and len(I_col_local[0][j+1])*sub_dim[j+1]>len(I_col_local[0][j]):
+                                    search = 1
                            
                         if j==0 and active==1:
                             t1s = MPI.Wtime()
@@ -1599,7 +1615,7 @@ if __name__ == "__main__":
                             super_rows = c1p[I_row_local[0][j],:]
                             super_cols = c1p[:,I_col_local[0][j]]
                             suptilde = np.zeros((super_cols.shape[0],super_rows.shape[1]))
-       
+                            
                         elif j>0 and j<len(dims)-2 and active==1:
                             t1s = MPI.Wtime()
                             
@@ -1637,20 +1653,23 @@ if __name__ == "__main__":
                             super_rows = c1p[I_row_local[0][j],:]
                             super_cols = c1p[:,I_col_local[0][j]]
                             suptilde = np.zeros((super_cols.shape[0],super_rows.shape[1]))
-                            
+                           
                         active = comm.gather([rank,active],root=0)
-                        
+                        search = comm.gather([rank,search],root=0)
                         ut2 = MPI.Wtime()
                         
                         if rank==0:
                             active_ranks = [active[i][0] for i in range(len(active)) if active[i][1]==1]
+                            search_ranks = [search[i][0] for i in range(len(search)) if search[i][1]==1]
                             #print(active_ranks)
                             for i in range(1,size):
                                 
                                 comm.send(active_ranks,dest = i,tag = 12)
+                                comm.send(search_ranks,dest = i,tag = 13)
                         
                         if rank!=0:
                             active_ranks = comm.recv(source = 0,tag = 12)
+                            search_ranks = comm.recv(source = 0,tag = 13)
                         ################################################################################################
                         #################### Lines 677 - 722 Build local cross approximations ########################## 
                         ################################################################################################
@@ -1664,7 +1683,7 @@ if __name__ == "__main__":
                         for l in range(len(selection[j])):
                             #comm.Barrier()
                             if rank in active_ranks:
-                            
+                                
                                 #EXTRACT ROW AND COL THAT ARE ON THEIR LOCAL RANK                
                                 row_vecs = []
                                 col_vecs = []
@@ -1750,9 +1769,10 @@ if __name__ == "__main__":
                         update_time+=ut3 - ut2        
                         #print(MPI.Wtime() - t2)   
                         #Run a pivot search over all active ranks
-                        if rank in active_ranks:
+                        if rank in search_ranks:
                             tt1 = MPI.Wtime()
                             I_row_local[0],I_col_local[0],FI_row_local[0],FI_col_local[0],p,ps,X_dict = Low_access_MPICrossInterpSingleItemSuperPivV2(tensor_entries,suptilde,bounds_p[rank],X_dict,I_row_local[0],I_col_local[0],FI_row_local[0],FI_col_local[0],j,sub_dim)
+                            
                             Selection_row_local[0][j] = np.append(Selection_row_local[0][j],counter[j])
                             Selection_col_local[0][j] = np.append(Selection_col_local[0][j],counter[j])
                             piv_vals = [p*ps]
@@ -1760,11 +1780,8 @@ if __name__ == "__main__":
                         #Gather the pivot values for selection
                         local_piv_value = comm.allgather(piv_vals)
 
-                        active_piv_value = [local_piv_value[i][0] for i in active_ranks]
-                        #selection[j].append(active_ranks[np.argmax(np.abs([active_piv_value[i] for i in range(len(active_ranks))]))])
-                        if any([active_piv_value[i] for i in range(len(active_ranks))]):
-                            selection[j].append(active_ranks[np.argmax(np.abs([active_piv_value[i] for i in range(len(active_ranks))]))])
-                        
+                        active_piv_value = [local_piv_value[i][0] for i in search_ranks]
+                        selection[j].append(search_ranks[np.argmax(np.abs([active_piv_value[i] for i in range(len(search_ranks))]))])
                         
                         row,col = Subtensor_Comm(selection[j][-1],shifting_p,j)
                         
@@ -1779,25 +1796,25 @@ if __name__ == "__main__":
                             info_index = comm.recv(source = selection[j][-1],tag = 1)
 
                         if rank!=selection[j][-1]:
-                                if rank in row and rank in active_ranks:
+                                if rank in row and rank in search_ranks:
                                     I_row_local[0][j][-1] = info_index[0][-1]
                                     FI_row_local[0][j][-1] = info_index[2][-1]
-                                elif rank in row and rank not in active_ranks:
+                                elif rank in row and rank not in search_ranks:
                                     I_row_local[0][j] = info_index[0]
                                     FI_row_local[0][j] = info_index[2]
                                     Selection_row_local[0][j] = np.append(Selection_row_local[0][j],counter[j])
-                                elif rank not in row and rank in active_ranks:
+                                elif rank not in row and rank in search_ranks:
                                     I_row_local[0][j] = np.delete(I_row_local[0][j],[-1])
                                     FI_row_local[0][j] = np.delete(FI_row_local[0][j],[-1])
                                     Selection_row_local[0][j] = np.delete(Selection_row_local[0][j],[-1])
-                                if rank in col and rank in active_ranks:
+                                if rank in col and rank in search_ranks:
                                     I_col_local[0][j][-1] = info_index[1][-1]
                                     FI_col_local[0][j][-1] = info_index[3][-1]
-                                elif rank in col and rank not in active_ranks:
+                                elif rank in col and rank not in search_ranks:
                                     I_col_local[0][j] = info_index[1]
                                     FI_col_local[0][j] = info_index[3]
                                     Selection_col_local[0][j] = np.append(Selection_col_local[0][j],counter[j])
-                                elif rank not in col and rank in active_ranks:
+                                elif rank not in col and rank in search_ranks:
                                     I_col_local[0][j] = np.delete(I_col_local[0][j],[-1])
                                     FI_col_local[0][j] = np.delete(FI_col_local[0][j],[-1])
                                     Selection_col_local[0][j] = np.delete(Selection_col_local[0][j],[-1])
@@ -1809,17 +1826,16 @@ if __name__ == "__main__":
                             I_row_global[j].append(adj_ind[0])
                             I_col_global[j].append(adj_ind[1])
                         comm.Barrier()
+                    
                     intermediate_time = MPI.Wtime()
                     t3_track = intermediate_time - t2
-                    #print([rank,old_cols[0]])
-                    #print([rank,old_rows])
                     #Set up items needed to construct global cores
                     if rank==0:
                         col_tk = [[] for _ in range(len(dims)-1)]
                         cols = [[] for _ in range(len(dims)-1)]
                         core_ranks=[1 for _ in range(len(dims)+1)]
                         for i in range(len(dims)-1):
-                            core_ranks[i+1] = len(I_row_global[i])
+                            core_ranks[i+1] = len(set(I_row_global[i]))
                         for i in range(1,size):
                             comm.send([I_row_global,I_col_global],dest = i,tag = 909)
 
@@ -1933,7 +1949,7 @@ if __name__ == "__main__":
                             super_rows,cols,X_dict = Lower_access_Superblock_test(tensor_entries,bounds_p[rank],FI_row_local[0][j-1],FI_col_local[0][j+1],I_row_local[0][j],I_col_local[0][j],j,X_dict,sub_dim)
                             #cols = c1p[:,I_col_local[0][j]]
                             info = [rank,cols,I_row_local[0][j],Selection_row_local[0][j],I_col_local[0][j]]
-
+                            
                         if j<len(dims)-1:
                             active = comm.gather([rank,active],root=0)
                             
@@ -1987,6 +2003,7 @@ if __name__ == "__main__":
                                     for i in range(len(rank_assignment[j])):
                                         temp.append([col_split[i],row_selx,local_ranks,loc_row_indx,rank_assignment[j],rank_assignment[j][i]])
                 temp_cols = []                  
+                
                 if world_rank==0:
                     
                     for i in range(len(temp)):
@@ -1996,7 +2013,7 @@ if __name__ == "__main__":
                             temp_cols.append(temp[i])
                             
                 if world_rank!=0 and world_rank<=np.max([x for y in rank_assignment for x in y]):#sum(dispatch):
-                    #print(rank_assignment.count([1]))
+                    
                     ph = [x for y in rank_assignment for x in y]
                     for _ in range(ph.count(world_rank)):
                         temp_cols.append(world_comm.recv(source = 0,tag = 999))
@@ -2055,7 +2072,7 @@ if __name__ == "__main__":
                                 ext = world_comm.recv(source = local_cols[2][new_order[j]],tag = 24)
 
                             Tk_local = np.concatenate((Tk_local+scale_value*Sk@ext,-scale_value*Sk),axis = 1)
-                        #print([world_rank,MPI.Wtime() - tt1,MPI.Wtime() - tt2])
+                        
                     
                 final_time = MPI.Wtime()
                 if world_rank==0:
