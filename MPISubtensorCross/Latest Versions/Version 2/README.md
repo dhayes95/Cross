@@ -1,6 +1,6 @@
 # DISTRIBUTED MEMORY PARALLEL ADAPTIVE TENSOR-TRAIN CROSS APPROXIMATION - Authors: Tianyi Shi, Daniel Hayes, Jingmei Qiu
 
-The file included in this folder titled "MPISubtensorTTCross_Version2_NumPy.py" is a self-contained file that will automatically load NumPy, math, and mpi4py. All other functions used are included before the main body of the file begins.
+The file included in this folder titled "MPISubtensorTTCross_Version2_PyTorch.py" is a self-contained file that will automatically load NumPy, math, and mpi4py. All other functions used are included before the main body of the file begins.
 
 # Description of the code
 
@@ -38,7 +38,7 @@ TENSOR_KIND = "maxwell4"
   * Input 5: List of required partition structure as a comma separated sequence of numbers, e.g., 1,2,1,1 would partition the second dimension into two intervals.
  
 Below is an example of a the setup to run a 4D Maxwellian tensor of size [800,400,800,400] with TT core ranks (1,10,5,20,1) on a partition of (1,8,8,1) over 10 test runs with 100000 error samples
-* change TENSOR_KIND to your desired one in Line 42 in MPISubtensorTTCross_Version2_NumPy.py
+* change TENSOR_KIND to your desired one in Line 42 in MPISubtensorTTCross_Version2_PyTorch.py
 * execute the command mpirun -n 64 MPISubtensorTTCross.py 100000 10 800,400,800,400 10,5,20 1,8,8,1 
 
 
