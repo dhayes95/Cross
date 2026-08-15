@@ -2032,7 +2032,7 @@ if __name__ == "__main__":
                                     MPI.Request.waitall(_nb_reqs)   # NONBLOCKING FIX: drain sends
                                     _nb_reqs = []
 
-                                # Candidate 2: rank-one cross-approximation update.
+                                # rank-one cross-approximation update.
                                 # addmm_ performs suptilde += delta * column @ row.
                                 suptilde_t.addmm_(
                                     Ej_t[:,-1:],
