@@ -1,7 +1,3 @@
-# *** NEW ADDITION *** 
-
-PyTorch on top of Vectorization, Key-byte representation (Result: For MPI Rank 1, the optimized code is faster than Version 1)
-
 # DISTRIBUTED MEMORY PARALLEL ADAPTIVE TENSOR-TRAIN CROSS APPROXIMATION - Authors: Tianyi Shi, Daniel Hayes, Jingmei Qiu
 
 The file included in this folder titled "MPISubtensorTTCross_Version2_NumPy.py" is a self-contained file that will automatically load NumPy, math, and mpi4py. All other functions used are included before the main body of the file begins.
