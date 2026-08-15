@@ -17,7 +17,7 @@ Items in part 2 follow the structure outlined in the paper, including the comput
 In order to run the code, it can be run through command line arguments, or sbatch files with the following input setup. 
 * 1 - Select the desired tensor definition in the .py file. Select the tensor to approximate by changing TENSOR_KIND near the beginning of the Python file:
 
-In Line 41, TENSOR_KIND = "hilbert"
+In Line 42, TENSOR_KIND = "hilbert"
 
 Available options are:
 
