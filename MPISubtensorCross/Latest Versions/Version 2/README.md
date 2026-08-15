@@ -1,6 +1,6 @@
 # *** NEW ADDITION *** 
 
-PyTorch on top of Vectorization, Key-byte representation (Result: the optimized code is faster than Version 1 for MPI Rank 1)
+PyTorch on top of Vectorization, Key-byte representation (Result: For MPI Rank 1, the optimized code is faster than Version 1)
 
 # DISTRIBUTED MEMORY PARALLEL ADAPTIVE TENSOR-TRAIN CROSS APPROXIMATION - Authors: Tianyi Shi, Daniel Hayes, Jingmei Qiu
 
