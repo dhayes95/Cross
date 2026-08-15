@@ -50,7 +50,7 @@ TORCH_DEVICE = torch.device("cpu")
 
 
 def _configure_torch_device():
-    """Configure PyTorch for CPU-only execution."""
+    """Configure PyTorch for CPU execution."""
     thread_count = os.environ.get("TT_TORCH_NUM_THREADS")
     if thread_count is not None:
         torch.set_num_threads(max(1, int(thread_count)))
@@ -58,7 +58,7 @@ def _configure_torch_device():
 
 
 def _torch_sync():
-    """No device synchronization is required for CPU execution."""
+    """No device synchronization"""
     return None
 
 def tensor_entry(index):
