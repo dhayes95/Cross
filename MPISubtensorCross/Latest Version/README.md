@@ -1,23 +1,24 @@
+# NEW ADDITION: Vectorization, Key-byte representation (Result: the optimized code is ~6x faster for Pivot Search, and ~30x faster for core construction)
 # DISTRIBUTED MEMORY PARALLEL ADAPTIVE TENSOR-TRAIN CROSS APPROXIMATION - Authors: Tianyi Shi, Daniel Hayes, Jingmei Qiu
 
-The file included in this folder titled "MPISubtensorTTCross_Version2_NumPy.py" is a self contained files that will automaticall load numpy, math, and mpi4py. All other functions used are included before the main body of the file begins.
+The file included in this folder titled "MPISubtensorTTCross_Version2_NumPy.py" is a self-contained file that will automatically load NumPy, math, and mpi4py. All other functions used are included before the main body of the file begins.
 
 # Description of the code
 
-The provided python code is split into two main parts:
-* 1 - The custom built functions which go from lines 25 - 1370
-* 2 - The implementation of the algorithm which goes from lines 1374 - 2053
+The provided Python code is split into two main parts:
+* 1 - The custom-built functions which go from lines 25 - 1496
+* 2 - The implementation of the algorithm, which goes from lines 1500 - 2372
 
-Functions in part 1 include items such as index specific functions, greedy pivot search functions, and functions pertaining to actions at the tensor level such as entrywise computation, unfoldings, and superblock constructions.
+Functions in part 1 include items such as index-specific functions, greedy pivot search functions, and functions pertaining to actions at the tensor level such as entrywise computation, unfoldings, and superblock constructions.
 
-Items in part two follow the structure outlined in the paper where lines 1374 - 1813 do the computation of all pivot selections across all dimensions, and the remainder of the code implements core construction. 
+Items in part 2 follow the structure outlined in the paper, including the computation of all pivot selections across all dimensions, and the remainder of the code implements core construction. 
 
 # Running the code
 
 In order to run the code, it can be run through command line arguments, or sbatch files with the following input setup. 
 * 1 - Select the desired tensor definition in the .py file. Select the tensor to approximate by changing TENSOR_KIND near the beginning of the Python file:
 
-TENSOR_KIND = "hilbert"
+In Line 41, TENSOR_KIND = "hilbert"
 
 Available options are:
 
