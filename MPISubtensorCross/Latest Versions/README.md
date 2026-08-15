@@ -2,7 +2,7 @@
 
 *** NEW ADDITION *** 
 
-Vectorization, Key-byte representation
+Vectorization, Key-byte representation, NumPy
 
 Result: the optimized code is ~6.1x faster for Pivot Search, and ~34x faster for core construction
 
