@@ -4,7 +4,7 @@
 
 Vectorization, Key-byte representation (NumPy)
 
-Result: the optimized code is ~6.1x faster for Pivot Search, and ~34x faster for core construction compared to [the previous version](https://github.com/dhayes95/Cross/edit/main/MPISubtensorCross/Latest%20Versions/README.md)
+Result: the optimized code is ~6.1x faster for Pivot Search, and ~34x faster for core construction compared to [the previous version](https://github.com/dhayes95/Cross/blob/main/MPISubtensorCross/MPISubtensorTTCross.py)
 
 # Version 2.
 
