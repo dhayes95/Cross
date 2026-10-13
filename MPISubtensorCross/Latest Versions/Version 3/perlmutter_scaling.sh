@@ -9,7 +9,7 @@
 # depend on your allocation and on whichever Python provides mpi4py in your
 # environment.  Nothing here is auto-detected.
 
-#SBATCH --account=<YOUR_ACCOUNT>
+#SBATCH --account=m2957
 #SBATCH --constraint=cpu
 #SBATCH --qos=regular
 #SBATCH --nodes=4
@@ -19,7 +19,7 @@
 #SBATCH --job-name=ttcross-blockcyclic
 #SBATCH --output=ttcross-%j.out
 
-module load python                 # must provide mpi4py (and torch for the PyTorch file)
+module load pytorch                # provides python + mpi4py (cray-mpich) + numpy + torch
 
 CODE=MPISubtensorTTCross_Version3_NumPy.py
 DIMS=1024,1024,1024,1024

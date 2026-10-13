@@ -278,17 +278,10 @@ def _pivot_values(I_arr, j_fixed, I_l, J_u, k, X_dim, X_dict, bounds, is_col=Tru
     """fills only cache misses (decoding bytes -> coords), returns values array."""
     I_arr = np.asarray(I_arr, dtype=np.int64)
     if is_col:
-        keys = Super_to_Global_batch(I_arr, np.full(I_arr.shape, j_fixed, dtype=np.int64), I_l, J_u, k, X_dim)
+        coords = Super_to_Global_coords(I_arr, np.full(I_arr.shape, j_fixed, dtype=np.int64), I_l, J_u, k, X_dim)
     else:
-        keys = Super_to_Global_batch(np.full(I_arr.shape, j_fixed, dtype=np.int64), I_arr, I_l, J_u, k, X_dim)
-    d = len(X_dim)
-    miss = [kk for kk in dict.fromkeys(keys) if kk not in X_dict]
-    if miss:
-        coords = np.frombuffer(b''.join(miss), dtype=np.int64).reshape(-1, d)
-        vals = tensor_entries(tensor_entry, [tuple(r) for r in coords.tolist()], bounds)
-        for kk, vv in zip(miss, vals):
-            X_dict[kk] = vv
-    return np.fromiter((X_dict[kk] for kk in keys), dtype=np.float64, count=len(keys))
+        coords = Super_to_Global_coords(np.full(I_arr.shape, j_fixed, dtype=np.int64), I_arr, I_l, J_u, k, X_dim)
+    return _cache_fetch(X_dict, coords, bounds)
 
 def _key(coord):
     # coord: a tuple/list/1-D array of ints -> one bytes key
@@ -302,6 +295,243 @@ def _keys_from_rows(arr2d):
 def _coord_from_key(bkey, d):
     # bytes key -> tuple coordinate (only needed on a miss, to call tensor_entry)
     return tuple(int(x) for x in np.frombuffer(bkey, dtype=np.int64))
+# --------------------------------------------------------------------------
+
+# ---- vectorised entry cache ----------------------------------------------
+# The bytes-keyed dict costs ~150 bytes and one Python-level operation per
+# cached entry, which made cache lookups, not tensor evaluation, the dominant
+# cost of superblock construction.  EntryCache holds the same entries in an
+# open-addressing hash table keyed by the block-local linear index, so lookups
+# and inserts are whole-array NumPy operations at ~32 bytes per entry.
+# Blocks too large for one int64 index (common in 6D/8D) use a two-part key:
+# the linear index of the leading and of the trailing dimensions.
+# Semantics are unchanged: a cached value is never recomputed, and misses are
+# evaluated in one batch in first-occurrence order, exactly as before, so the
+# results are bit-identical.  The dict API used by the remaining scalar call
+# sites (bytes keys) is kept.
+
+class EntryCache:
+    _H1 = np.uint64(0x9E3779B97F4A7C15)
+    _H2 = np.uint64(0xC2B2AE3D27D4EB4F)
+    _MAXLOAD = 0.6
+    _LIMIT = 2**62
+
+    def __init__(self, dims):
+        self.dims = tuple(int(x) for x in dims)
+        s = EntryCache._split(self.dims)
+        if s is None:
+            raise ValueError("block too large for a two-part key")
+        groups = [self.dims] if s == len(self.dims) else [self.dims[:s], self.dims[s:]]
+        self.split = s
+        self.parts = len(groups)
+        self.strides = [np.array([math.prod(g[i+1:]) for i in range(len(g))], dtype=np.int64) for g in groups]
+        self.n = 0
+        self._alloc(1 << 10)
+
+    @staticmethod
+    def _split(dims):
+        # number of leading dims in the first key part (len(dims) = one part)
+        if math.prod(dims) < EntryCache._LIMIT:
+            return len(dims)
+        best = None
+        for s in range(1, len(dims)):
+            a, b = math.prod(dims[:s]), math.prod(dims[s:])
+            if a < EntryCache._LIMIT and b < EntryCache._LIMIT and (best is None or max(a, b) < best[0]):
+                best = (max(a, b), s)
+        return None if best is None else best[1]
+
+    @staticmethod
+    def fits(dims):
+        return EntryCache._split(tuple(int(x) for x in dims)) is not None
+
+    def _alloc(self, cap):
+        self.cap = cap
+        self.mask = cap - 1
+        self.shift = np.uint64(64 - (cap.bit_length() - 1))
+        self.keys = np.full((cap, self.parts), -1, dtype=np.int64)
+        self.vals = np.empty(cap, dtype=np.float64)
+        self.claim = np.empty(cap, dtype=np.int64)
+
+    def linear(self, coords):
+        coords = np.asarray(coords, dtype=np.int64).reshape(-1, len(self.dims))
+        if self.parts == 1:
+            return (coords @ self.strides[0])[:, None]
+        s = self.split
+        return np.column_stack((coords[:, :s] @ self.strides[0], coords[:, s:] @ self.strides[1]))
+
+    def _slot0(self, K):
+        h = K[:, 0].astype(np.uint64) * self._H1
+        if self.parts == 2:
+            h = (h ^ (K[:, 1].astype(np.uint64) * self._H2)) * self._H1
+        return (h >> self.shift).astype(np.int64)
+
+    def _same(self, p, K):
+        if self.parts == 1:
+            return self.keys[p, 0] == K[:, 0]
+        return (self.keys[p, 0] == K[:, 0]) & (self.keys[p, 1] == K[:, 1])
+
+    def _unique(self, K):
+        # first-occurrence index and inverse of the distinct rows of K
+        if self.parts == 1:
+            _, first, inv = np.unique(K[:, 0], return_index=True, return_inverse=True)
+        else:
+            rows = np.ascontiguousarray(K).view(np.dtype((np.void, 16))).ravel()
+            _, first, inv = np.unique(rows, return_index=True, return_inverse=True)
+        return first, inv.reshape(-1)
+
+    def _find(self, K):
+        # slot holding each key, or -1
+        pos = self._slot0(K)
+        out = np.full(K.shape[0], -1, dtype=np.int64)
+        todo = np.arange(K.shape[0])
+        while todo.size:
+            p = pos[todo]
+            hit = self._same(p, K[todo])
+            out[todo[hit]] = p[hit]
+            cont = ~hit & (self.keys[p, 0] != -1)
+            todo = todo[cont]
+            pos[todo] = (p[cont] + 1) & self.mask
+        return out
+
+    def _insert(self, K, v):
+        # K: keys known to be absent and distinct.  Returns the slot of each key.
+        need = self.n + K.shape[0]
+        if need > self._MAXLOAD*self.cap:
+            cap = self.cap
+            while need > 0.5*cap:
+                cap *= 2
+            used = self.keys[:, 0] != -1
+            oK, ov = self.keys[used], self.vals[used]
+            self._alloc(cap)
+            self.n = 0
+            self._insert(oK, ov)
+        pos = self._slot0(K)
+        todo = np.arange(K.shape[0])
+        while todo.size:
+            p = pos[todo]
+            free = self.keys[p, 0] == -1
+            cand, cp = todo[free], p[free]
+            # several keys may race for one free slot: each writes its id to
+            # the slot's claim, the id that landed takes the slot and the
+            # others keep probing
+            self.claim[cp] = cand
+            won = self.claim[cp] == cand
+            self.keys[cp[won]] = K[cand[won]]
+            self.vals[cp[won]] = v[cand[won]]
+            done = np.zeros(todo.size, dtype=bool)
+            done[np.flatnonzero(free)[won]] = True
+            todo = todo[~done]
+            pos[todo] = (pos[todo] + 1) & self.mask
+        self.n = need
+        return pos
+
+    def fetch(self, coords, evaluate):
+        """Values at block-local coords (m,d); misses go to evaluate(miss_coords)."""
+        coords = np.asarray(coords, dtype=np.int64).reshape(-1, len(self.dims))
+        K = self.linear(coords)
+        slot = self._find(K)
+        miss = np.flatnonzero(slot < 0)
+        if miss.size:
+            # distinct missing keys, evaluated in first-occurrence order
+            first, inv = self._unique(K[miss])
+            order = np.argsort(first, kind='stable')
+            new = miss[first[order]]
+            vals = np.asarray(evaluate(coords[new]), dtype=np.float64).reshape(-1)
+            if vals.size != new.size:
+                raise ValueError("tensor_entries must return one value for each input multi-index")
+            cap = self.cap
+            uslot = np.empty(first.size, dtype=np.int64)
+            uslot[order] = self._insert(K[new], vals)
+            if self.cap != cap:
+                hit = slot >= 0                 # the table was rehashed
+                slot[hit] = self._find(K[hit])
+            slot[miss] = uslot[inv]
+        return self.vals[slot]
+
+    def put_missing(self, coords, vals):
+        """Insert (coords, vals) pairs whose key is not cached yet; first one wins."""
+        vals = np.asarray(vals, dtype=np.float64).reshape(-1)
+        K = self.linear(coords)
+        miss = np.flatnonzero(self._find(K) < 0)
+        if miss.size:
+            first, _ = self._unique(K[miss])
+            new = miss[np.sort(first)]
+            self._insert(K[new], vals[new])
+
+    # dict API for the scalar call sites, bytes keys as produced by _key()
+    def _k1(self, bkey):
+        return self.linear(np.frombuffer(bkey, dtype=np.int64))
+
+    def __contains__(self, bkey):
+        return self._find(self._k1(bkey))[0] >= 0
+
+    def __getitem__(self, bkey):
+        s = self._find(self._k1(bkey))[0]
+        if s < 0:
+            raise KeyError(bkey)
+        return self.vals[s]
+
+    def __setitem__(self, bkey, value):
+        K = self._k1(bkey)
+        s = self._find(K)[0]
+        if s >= 0:
+            self.vals[s] = value
+        else:
+            self._insert(K, np.array([value], dtype=np.float64))
+
+    def __len__(self):
+        return self.n
+
+
+class CrossApprox:
+    """Cross approximation sum_l delta_l * Ej_l Ei_l^T of one superblock, kept
+    as its rank-one factors.
+
+    The pivot search only ever reads single entries, rows and columns of the
+    approximation, so the dense superblock-sized matrix (and the full rebuild
+    of it every sweep) is never formed.  Each requested value is accumulated
+    term by term with exactly the operations the dense in-place update
+    'A += delta*np.outer(Ej,Ei)' performed, so it is bit-identical.
+    Supports A[i,j], A[rows,j], A[i,cols], A[rows,cols] (paired),
+    A[[i],:] and A[:,[j]], which is every pattern the search uses."""
+
+    def __init__(self, m, n):
+        self.shape = (int(m), int(n))
+        self.D = []
+        self.U = []
+        self.V = []
+
+    def add(self, delta, ej, ei):
+        self.D.append(delta)
+        self.U.append(np.ravel(ej))
+        self.V.append(np.ravel(ei))
+
+    def __getitem__(self, key):
+        ri, ci = key
+        outer = isinstance(ri, slice) or isinstance(ci, slice)
+        if outer:
+            ri = np.arange(self.shape[0])[ri] if isinstance(ri, slice) else np.atleast_1d(ri)
+            ci = np.arange(self.shape[1])[ci] if isinstance(ci, slice) else np.atleast_1d(ci)
+            pair = lambda u, v: u[ri][:, None]*v[ci][None, :]
+            out = np.zeros((len(ri), len(ci)))
+        else:
+            pair = lambda u, v: u[ri]*v[ci]
+            out = np.zeros(np.broadcast(np.asarray(ri), np.asarray(ci)).shape)
+        for d, u, v in zip(self.D, self.U, self.V):
+            out += d*pair(u, v)
+        return out[()] if out.ndim == 0 else out
+
+
+def _new_entry_cache(dims):
+    # blocks too large even for a two-part key keep the bytes-keyed dict
+    return EntryCache(dims) if EntryCache.fits(dims) else {}
+
+
+def _cache_fetch(X_dict, coords, bounds):
+    """Cached values of block-local entries coords (m,d), evaluating misses in one batch."""
+    if isinstance(X_dict, EntryCache):
+        return X_dict.fetch(coords, lambda c: tensor_entries(tensor_entry, c, bounds))
+    return _cached_entries_from_keys(tensor_entries, _keys_from_rows(coords), bounds, X_dict, np.shape(coords)[1])
 # --------------------------------------------------------------------------
 
 def Full_To_Super(ind_row,ind_col,k,dim):
@@ -841,19 +1071,13 @@ def Low_Access_MPIGreedy_Search_PivV2(tensor_entries,At,I,J,I_l,J_u,k,X_dim,boun
             
             sample_number = np.min([sample_size,dim[0]-len(I),dim[1]-len(J)])
             
-            a = random.sample(list(np.arange(At.shape[0])),sample_number)
-            b = random.sample(list(np.arange(At.shape[1])),sample_number)
+            #range() draws the same sample as the materialised list did
+            a = random.sample(range(At.shape[0]),sample_number)
+            b = random.sample(range(At.shape[1]),sample_number)
 
             rand_inds = [[a[i],b[i]] for i in range(sample_number)]
-            _rk = Super_to_Global_batch(np.asarray(a,dtype=np.int64), np.asarray(b,dtype=np.int64), I_l, J_u, k, X_dim)
-            _d = len(X_dim)
-            _miss = [kk for kk in dict.fromkeys(_rk) if kk not in X_dict]
-            if _miss:
-                _coords = np.frombuffer(b''.join(_miss), dtype=np.int64).reshape(-1, _d)
-                _vals = tensor_entries(tensor_entry, [tuple(r) for r in _coords.tolist()], bounds)
-                for _kk, _vv in zip(_miss, _vals):
-                    X_dict[_kk] = _vv
-            true_vals = np.fromiter((X_dict[kk] for kk in _rk), dtype=np.float64, count=len(_rk))
+            _rc = Super_to_Global_coords(np.asarray(a,dtype=np.int64), np.asarray(b,dtype=np.int64), I_l, J_u, k, X_dim)
+            true_vals = _cache_fetch(X_dict, _rc, bounds)
             
             approx_vals = At[np.asarray(a,dtype=np.int64), np.asarray(b,dtype=np.int64)]
                 
@@ -1028,6 +1252,10 @@ def Super_to_Global(super_index,I,J,k,dim):
     return _key(global_index)
 
 def Super_to_Global_batch(r, c, I, J, k, dim):
+    # Same as Super_to_Global_coords, returned as bytes keys.
+    return _keys_from_rows(Super_to_Global_coords(r, c, I, J, k, dim))
+
+def Super_to_Global_coords(r, c, I, J, k, dim):
     # Vectorized batched form of Super_to_Global: maps arrays of superblock
     d = len(dim)
     lenJ = len(J)
@@ -1068,30 +1296,31 @@ def Super_to_Global_batch(r, c, I, J, k, dim):
         q = rem // stride
         g[:, i] = q
         rem = rem - q * stride
-    return _keys_from_rows(g)
+    return g
 
 def better_kickstart(tensor_entries,bounds,X_dict,X_dim,maxiter = 10,sample_size = 10):
 
     index = [tuple([random.randint(0,X_dim[j]-1) for j in range(len(X_dim))]) for _ in range(sample_size)]
     values = tensor_entries(tensor_entry,index,bounds)
-    for i in range(len(index)):
-        _kk = _key(index[i])
-        if _kk not in X_dict:
-            X_dict[_kk] = values[i]
+    if isinstance(X_dict, EntryCache):
+        X_dict.put_missing(index, values)
+    else:
+        for i in range(len(index)):
+            _kk = _key(index[i])
+            if _kk not in X_dict:
+                X_dict[_kk] = values[i]
     start_index = index[np.argmax(np.abs(values))]
 
     count = 0
       
+    #Each fiber is fetched as one batch; the entry functions are element-wise,
+    #so this gives the same values as evaluating the entries one at a time.
     for _ in range(10):
         for i in range(len(X_dim)):
-            index = [tuple(start_index[:i]) + tuple([j])+tuple(start_index[i+1:]) for j in range(X_dim[i])]
-            values = []
-            for l in range(len(index)):
-                _kk = _key(index[l])
-                if _kk not in X_dict:
-                    X_dict[_kk] = tensor_entries(tensor_entry,[index[l]],bounds)[0]
-                values.append(X_dict[_kk])
-            start_index = index[np.argmax(np.abs(values))]
+            index = np.tile(np.asarray(start_index, dtype=np.int64), (X_dim[i], 1))
+            index[:, i] = np.arange(X_dim[i])
+            values = _cache_fetch(X_dict, index, bounds)
+            start_index = tuple(int(x) for x in index[np.argmax(np.abs(values))])
         
         
 
@@ -1235,11 +1464,11 @@ def Lower_access_Superblock_test(tensor_entries,bounds,I_inp,J_inp,row_list,col_
     _NC = len(J)*X_dim[k+1]
     _rr = np.repeat(np.asarray(row_list,dtype=np.int64), _NC)
     _cc = np.tile(np.arange(_NC,dtype=np.int64), len(row_list))
-    col_inds = Super_to_Global_batch(_rr,_cc,I,J,k,X_dim)
+    col_inds = Super_to_Global_coords(_rr,_cc,I,J,k,X_dim)
     _LASB['index'] += MPI.Wtime() - _t0
 
     _t0 = MPI.Wtime()
-    tensor_values = _cached_entries_from_keys(tensor_entries, col_inds, bounds, X_dict, len(X_dim))
+    tensor_values = _cache_fetch(X_dict, col_inds, bounds)
     _LASB['eval'] += MPI.Wtime() - _t0
 
     _t0 = MPI.Wtime()
@@ -1254,11 +1483,11 @@ def Lower_access_Superblock_test(tensor_entries,bounds,I_inp,J_inp,row_list,col_
     _NR = len(I)*X_dim[k]
     _rr = np.repeat(np.arange(_NR,dtype=np.int64), len(col_list))
     _cc = np.tile(np.asarray(col_list,dtype=np.int64), _NR)
-    row_inds = Super_to_Global_batch(_rr,_cc,I,J,k,X_dim)
+    row_inds = Super_to_Global_coords(_rr,_cc,I,J,k,X_dim)
     _LASB['index'] += MPI.Wtime() - _t0
 
     _t0 = MPI.Wtime()
-    tensor_values = _cached_entries_from_keys(tensor_entries, row_inds, bounds, X_dict, len(X_dim))
+    tensor_values = _cache_fetch(X_dict, row_inds, bounds)
     _LASB['eval'] += MPI.Wtime() - _t0
 
     _t0 = MPI.Wtime()
@@ -1339,9 +1568,9 @@ def Lower_access_Superblock_subblock(tensor_entries,bounds,I_inp,J_inp,k,X_dict,
 
     _rr = np.repeat(np.arange(_NR,dtype=np.int64), _NC)
     _cc = np.tile(np.arange(_NC,dtype=np.int64), _NR)
-    cell_indices = Super_to_Global_batch(_rr,_cc,I,J,k,X_dim)
+    cell_indices = Super_to_Global_coords(_rr,_cc,I,J,k,X_dim)
 
-    tensor_values = _cached_entries_from_keys(tensor_entries, cell_indices, bounds, X_dict, len(X_dim))
+    tensor_values = _cache_fetch(X_dict, cell_indices, bounds)
     Super_block = np.reshape(tensor_values,[_NR,_NC])
 
     return Super_block,X_dict
@@ -1413,6 +1642,15 @@ def _cached_core_entries_batch(tensor_entries, tensor_indices, X_dict):
     tensor_indices = np.asarray(tensor_indices, dtype=np.int64)
     if tensor_indices.ndim == 1:
         tensor_indices = tensor_indices.reshape(1, -1)
+
+    if isinstance(X_dict, EntryCache):
+        # The cache only covers its own block; entries outside it are evaluated.
+        inside = np.all(tensor_indices < np.asarray(X_dict.dims), axis=1)
+        out = np.empty(tensor_indices.shape[0], dtype=np.float64)
+        out[inside] = X_dict.fetch(tensor_indices[inside], tensor_entries)
+        if not inside.all():
+            out[~inside] = np.asarray(tensor_entries(tensor_indices[~inside])).reshape(-1)
+        return out
 
     keys = _keys_from_rows(tensor_indices)
     key_to_row = {}
@@ -1754,6 +1992,20 @@ if __name__ == "__main__":
             ROW_GID, COL_GID = Unfolding_Group_Ids(block_coords,block_grid)
             layout_report = Block_Cyclic_Report(block_grid,processor_partition,rank_blocks,_MAP)
 
+            #Row and column communicators for every unfolding, set up once.
+            #Blocks that share a row group of unfolding k (same first k+1 block
+            #coordinates) live on processes with the same first k+1 grid
+            #coordinates, because both mappings are per-dimension products; so
+            #one Split per unfolding gives the row (and column) groups of the
+            #paper as communicators.  The cross-vector exchange then stays
+            #inside the group instead of going to every rank.
+            if color==10:
+                _pcoord = Large_unravel(rank,processor_partition)
+                row_comms = [comm.Split(Large_ravel(_pcoord[:k+1],processor_partition[:k+1]),rank)
+                             for k in range(len(dims)-1)]
+                col_comms = [comm.Split(Large_ravel(_pcoord[k+1:],processor_partition[k+1:]),rank)
+                             for k in range(len(dims)-1)]
+
             if color==10:
                 #sweeps is used to track the number of ranks for each dimension connection
                 sweeps = []
@@ -1787,7 +2039,7 @@ if __name__ == "__main__":
                 if world_rank==0:
                     print('starting run',ll)
                 if color==10:    
-                    X_dict = [{} for _ in range(nloc)]
+                    X_dict = [_new_entry_cache(sub_dim[bl]) for bl in range(nloc)]
                     IndiI_dict = {}
                     deltas = []
                     search_time = 0
@@ -2011,7 +2263,7 @@ if __name__ == "__main__":
 
                             super_rows[bl] = c1p[I_row_local[bl][j],:]
                             super_cols[bl] = c1p[:,I_col_local[bl][j]]
-                            suptilde[bl] = np.zeros((super_cols[bl].shape[0],super_rows[bl].shape[1]))
+                            suptilde[bl] = CrossApprox(super_cols[bl].shape[0],super_rows[bl].shape[1])
 
                         #One collective instead of a gather/scatter pair over ranks.
                         _as = _prof_comm('piv',comm,lambda: comm.allgather((my_active,my_search)))
@@ -2100,12 +2352,16 @@ if __name__ == "__main__":
                                     Ej_cur[bl] = new_ej
                                     ej_send[ROW_GID[j][b]] = new_ej
 
-                            #One allgather replaces the O(p) point-to-point pairs.
-                            _ex = _prof_comm('piv',comm,lambda: comm.allgather((ei_send,ej_send)))
+                            #A superblock row is needed by the blocks of the same
+                            #block column, which live in this process's column
+                            #group; a superblock column by the row group.
+                            _exi = _prof_comm('piv',col_comms[j],lambda: col_comms[j].allgather(ei_send))
+                            _exj = _prof_comm('piv',row_comms[j],lambda: row_comms[j].allgather(ej_send))
                             ei_all = {}
                             ej_all = {}
-                            for _e,_f in _ex:
+                            for _e in _exi:
                                 ei_all.update(_e)
+                            for _f in _exj:
                                 ej_all.update(_f)
 
                             for bl in range(nloc):
@@ -2119,7 +2375,7 @@ if __name__ == "__main__":
                                 if _g in ej_all:
                                     Ej_cur[bl] = ej_all[_g]
                                 if Ei_cur[bl] is not None and Ej_cur[bl] is not None:
-                                    suptilde[bl] += delta*np.outer(Ej_cur[bl],Ei_cur[bl])
+                                    suptilde[bl].add(delta,Ej_cur[bl],Ei_cur[bl])
 
                         ut3 = MPI.Wtime()
                         internal_tt += ut2-ut1
