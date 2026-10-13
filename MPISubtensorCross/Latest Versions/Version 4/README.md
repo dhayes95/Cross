@@ -78,6 +78,41 @@ row segment; and per sweep at most one row-group and one column-group allgather 
 short vectors. This is the communication pattern analysed in the paper, with the
 subtensor tile sides replaced by `|I_{k-1}| n_k / p_r` and `n_{k+1} |J_{k+1}| / p_c`.
 
+## Core construction
+
+The TT core of unfolding k is the interpolation matrix `W_k = A_k(:,J_k) A_k(I_k,J_k)^{-1}`
+(rows `(prefix, i_k)`, reshaped to `r_{k-1} x n_k x r_k`), which Versions 1-3 compute by
+re-pulling the pivot columns and running the column-by-column recurrence `Low_Access_Tk`.
+With the factors kept here it has a closed form: since the cross approximation is exact
+on the pivot rows and columns,
+
+```
+W_k = U_k · U_k(I_k, :)^{-1}
+```
+
+and `U_k(I_k, :)` is the small lower-triangular matrix whose strict lower part is `Qm`
+and whose diagonal holds the pivot residuals - both already on every rank. Each process
+therefore computes its rows of every core with one `r x r` triangular solve on its slice
+of `U_k` (the `p_c` processes of a row split the rows), with no tensor evaluation and no
+communication beyond the final gather to rank 0. Rows still pending from the lazy sync
+are finished first using only the pivot columns at those rows (`|pending| x r_k`
+entries). The last core is `A_{d-2}(I_{d-2}, :)`, the pivot rows of the last tile.
+Error sampling is split over the ranks as well.
+
+`TT_CHECK_CORES=1` makes rank 0 also run the Version 3 serial routine on the same pivot
+sets and print the relative deviation per core; it is `1e-14` for the Hilbert tensors and
+`cond(A(I,J))·eps` in general.
+
+**`TT_TOL`.** Stop adding pivots to an unfolding once `|pivot residual| < TT_TOL · |first
+residual|` (default 0, i.e. the Version 3 behaviour of stopping only at an exactly zero
+residual). This matters when the requested rank exceeds the numerical rank of an
+unfolding: on the 6D Maxwellian the rank-5 unfoldings have numerical rank 4, the fifth
+residual is `1e-15`, `cond(A(I,J)) = 1e16`, and the core is then meaningless in both
+Version 3 and Version 4 (both violate `W(I,:) = Id` by ~10%; the TT error stays small only
+because the garbage lies in a direction that cancels). With `TT_TOL=1e-13` those
+unfoldings stop at rank 4 and all cores agree with the serial routine to `1e-14`.
+`Core ranks` always reports the ranks actually reached.
+
 ## Data layer
 
 The layout is separate from where the tensor lives. `FunctionalTensor.fetch(indices)`
@@ -101,7 +136,9 @@ srun -n P python MPISubtensorTTCross_Version4_NumPy.py err_samples trials dims r
 
 Environment variables `TT_SEED`, `TT_PROFILE`, `TT_PROFILE_RANKS`, `TT_PROFILE_OUT` have
 the Version 3 meanings; the CSV has the same columns, so `profile_summary.py` from
-Version 3 reads it. The report adds the tile area per rank (sum over unfoldings) and
+Version 3 reads it. New here: `TT_TOL` (relative stopping tolerance on the pivot
+residual, default 0) and `TT_CHECK_CORES=1` (compare the cores with the serial Version 3
+routine), both described under *Core construction*. The report adds the tile area per rank (sum over unfoldings) and
 its max/avg, which is the layout's own balance metric, and the global size of every
 `A_k` at the end.
 
@@ -115,10 +152,12 @@ its max/avg, which is the layout's own balance metric, and the global size of ev
   prototype.
 * The starting pivot is found globally (every rank samples and climbs, the best wins)
   instead of per block.
-* If the largest remaining residual is exactly zero the unfolding stops growing instead
-  of adding a zero pivot; `Core ranks` reports the ranks actually reached.
-* Core construction and error sampling run serially on rank 0 with the Version 3
-  routines. The parallel core construction of Version 3 is not ported.
+* If the largest remaining residual is exactly zero (or below `TT_TOL` relative to the
+  first one) the unfolding stops growing instead of adding a zero pivot; `Core ranks`
+  reports the ranks actually reached.
+* Core construction uses the closed form above instead of the Version 3 recurrence and
+  grids; the error samples are drawn per rank, so the error estimate is not the same
+  random draw as Version 3's.
 * There is no PyTorch file yet.
 
 # Memory
@@ -162,5 +201,8 @@ subtensor layout in the study that motivated this version; the remaining loss at
 on these small problems is collective latency, not imbalance. The number of entries
 fetched does not depend on the process grid.
 
-The rank-0 serial core construction (1.8-9 s here) is now longer than the pivot search
-and is the obvious next thing to parallelise.
+Core construction plus error sampling (20000 samples x 10) with the closed-form solve
+takes 0.06-0.19 s in all of these runs on 4-64 ranks, against 1.8-9 s for the rank-0
+serial routine it replaced. The cores agree with that routine to `cond(A(I,J))·eps`:
+`1e-8` for Hilbert 2048^4 and 8D, `1e-6`-`1e-5` for Hilbert 512^4 (pivot residuals
+reach `1e-10`), `1e-14` for the 6D Maxwellian with `TT_TOL=1e-13`.

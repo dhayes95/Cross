@@ -746,9 +746,36 @@ def kickstart(data, dims, rng, sample_size=10, iters=10):
     return tuple(int(t) for t in x), best
 
 
+def tt_values(cores, idx):
+    """TT values at a batch of multi-indices idx (n, d)."""
+    idx = np.asarray(idx, dtype=np.int64)
+    v = cores[0][0, idx[:, 0], :]                               # (n, r_1)
+    for k in range(1, len(cores)):
+        v = np.einsum('nr,rns->ns', v, cores[k][:, idx[:, k], :])
+    return v[:, 0]
+
+
+def sampled_error(cores, dims, nsamples, world, seed, reps=10):
+    """Relative error on nsamples random entries, repeated reps times, the
+    samples split over all ranks (Version 3 draws them serially on rank 0)."""
+    P, rank = world.Get_size(), world.Get_rank()
+    rng = np.random.default_rng(None if seed is None else seed + 7919 + rank)
+    n_loc = nsamples // P + (1 if rank < nsamples % P else 0)
+    part = np.zeros((reps, 2))
+    for t in range(reps):
+        idx = np.stack([rng.integers(0, n, n_loc) for n in dims], 1)
+        if n_loc:
+            a = np.asarray(tensor_entries_glob(idx)).reshape(-1)
+            b = tt_values(cores, idx)
+            part[t] = [np.sum((a - b) ** 2), np.sum(a ** 2)]
+    tot = _prof_comm('core', world, lambda: world.allreduce(part, op=MPI.SUM))
+    return np.sqrt(tot[:, 0] / tot[:, 1])
+
+
 class PivotOrderCross:
-    def __init__(self, dims, pr, pc, nb, data, world, seed):
+    def __init__(self, dims, pr, pc, nb, data, world, seed, tol=0.0):
         self.dims = [int(x) for x in dims]
+        self.tol = tol                 # stop an unfolding when |pivot residual| < tol*|first residual|
         self.d = len(dims)
         self.pr, self.pc, self.nb = pr, pc, nb
         self.world = world
@@ -844,6 +871,77 @@ class PivotOrderCross:
                 unf.A.add_rows(Anew)
                 unf.U.add_rows(Unew)
 
+    # ---- core construction ----
+    def finish_rows_for_core(self, unf):
+        """Extend U to the rows still pending from the lazy sync.  Only the
+        pivot columns at those rows are needed, not the whole strip; the tile A
+        is left as it is (nothing reads it after this point)."""
+        if unf.npre_done >= len(unf.prefixes):
+            return
+        rows_new = np.concatenate([unf.my_new_rows(pidx) for pidx in range(unf.npre_done, len(unf.prefixes))])
+        unf.npre_done = len(unf.prefixes)
+        if rows_new.size == 0:                   # identical for the whole row group
+            return
+        l = len(unf.dl)
+        mycols = [(m, jm) for m, jm in enumerate(unf.piv_cols) if unf.owner_col(jm) == self.my_pc]
+        mine = []
+        if mycols:
+            Ablk = unf.fetch_block(self.data, rows_new, np.array([jm for _, jm in mycols], dtype=np.int64))
+            mine = [(m, Ablk[:, t]) for t, (m, _) in enumerate(mycols)]
+        allm = _prof_comm('core', self.row_comm, lambda: self.row_comm.allgather(mine))
+        Ap = np.empty((rows_new.size, l))
+        for chunk in allm:
+            for m, colv in chunk:
+                Ap[:, m] = colv
+        Unew = np.empty((rows_new.size, l))
+        for m in range(l):
+            Unew[:, m] = Ap[:, m] - Unew[:, :m] @ (unf.dl[:m] * unf.Pm[:m, m])
+        unf.rows = np.concatenate((unf.rows, rows_new))
+        unf.U.add_rows(Unew)
+
+    def pivot_matrix(self, unf):
+        """U_k(I_k, :): lower triangular; Qm below the diagonal, pivot residuals on it."""
+        l = len(unf.dl)
+        T = np.zeros((l, l))
+        for a in range(l):
+            T[a, :a] = unf.Qm[:a, a]
+            T[a, a] = 1.0 / unf.dl[a]
+        return T
+
+    def build_cores(self):
+        """TT cores W_k = U_k U_k(I_k,:)^{-1}, assembled on rank 0 (None elsewhere).
+
+        Every process row holds U_k for its rows, so the solve is local; the
+        p_c processes of a row split its rows between them.  The last core is
+        A_{d-2}(I_{d-2}, :), the pivot rows of the last tile."""
+        d = self.d
+        cores = [None] * d
+        for k, unf in enumerate(self.unfs):
+            self.finish_rows_for_core(unf)
+            l = len(unf.dl)
+            T = self.pivot_matrix(unf)
+            sl = slice(self.my_pc, None, self.pc)
+            rows_sl = unf.rows[sl]
+            Wsl = np.linalg.solve(T.T, unf.U.a[sl].T).T if rows_sl.size else np.zeros((0, l))
+            parts = _prof_comm('core', self.world, lambda: self.world.gather((rows_sl, Wsl), root=0))
+            if self.rank == 0:
+                W = np.empty((unf.nrows_glob(), l))
+                for r_, w_ in parts:
+                    W[r_] = w_
+                cores[k] = W.reshape(len(unf.prefixes), unf.nk, l)
+        unf = self.unfs[-1]
+        l = len(unf.dl)
+        mine = [(m, unf.cols, unf.A.a[unf.lr(im), :].copy())
+                for m, im in enumerate(unf.piv_rows) if unf.owner_row(im) == self.my_pr]
+        parts = _prof_comm('core', self.world, lambda: self.world.gather(mine, root=0))
+        if self.rank == 0:
+            C = np.empty((l, unf.nk1))
+            for chunk in parts:
+                for m, cols, vals in chunk:
+                    C[m, cols] = vals
+            cores[d - 1] = C.reshape(l, unf.nk1, 1)
+        return cores if self.rank == 0 else None
+
     # ---- phases ----
     def initialise(self):
         rng = random.Random(None if self.seed is None else self.seed + self.rank)
@@ -872,7 +970,9 @@ class PivotOrderCross:
         allc = _prof_comm('piv', self.world, lambda: self.world.allgather(cand))
         best = max(range(len(allc)), key=lambda r: (allc[r][0], -r))
         aval, val, i, j = allc[best]
-        if aval == 0.0:
+        if aval == 0.0 or aval < self.tol * abs(1.0 / unf.dl[0]):
+            # nothing left to gain: a further pivot would make A(I,J) numerically
+            # singular and the core W = A(:,J) A(I,J)^{-1} meaningless
             return False
         self.add_pivot(unf, i, j, val)
         pidx, ik = divmod(i, unf.nk); sidx, ik1 = divmod(j, unf.nk1)
@@ -922,6 +1022,7 @@ if __name__ == "__main__":
     _PROFILE_SYNC = os.environ.get("TT_PROFILE") not in (None, "", "0")
     _PROF_MAXRANKS = int(os.environ.get("TT_PROFILE_RANKS", "16"))
     _PROF_OUT = os.environ.get("TT_PROFILE_OUT")
+    _TOL = float(os.environ.get("TT_TOL", "0"))
 
     reason = None
     if pr * pc != P:
@@ -940,33 +1041,30 @@ if __name__ == "__main__":
             print('starting run', ll)
         world.Barrier()
         t0 = MPI.Wtime()
-        cross = PivotOrderCross(dims, pr, pc, nb, data, world, _SEED)
+        cross = PivotOrderCross(dims, pr, pc, nb, data, world, _SEED, _TOL)
         cross.run(rs)
         t1 = MPI.Wtime()
         _PROF['piv']['total'] = t1 - t0
 
-        # ---- core construction and error, serial on rank 0 as in Version 3 ----
+        area = cross.tile_area()
+        core_ranks = [1] + [len(u.dl) for u in cross.unfs] + [1]
+
+        # ---- core construction: W_k = U_k U_k(I_k,:)^{-1} from the stored factors ----
         tc0 = MPI.Wtime()
-        if world_rank == 0:
-            I_row_global = [[Large_ravel(ip, dims[:k + 1]) for ip in cross.Ipiv[k]] for k in range(len(dims) - 1)]
-            I_col_global = [[Large_ravel(jp, dims[k + 1:]) for jp in cross.Jpiv[k]] for k in range(len(dims) - 1)]
-            core_ranks = [1] + [len(set(I_row_global[k])) for k in range(len(dims) - 1)] + [1]
-            cores, _ = Low_Access_Core_Extract_Update(tensor_entries_glob, dims, _new_entry_cache(dims), I_row_global, I_col_global)
-            if _SEED is not None:
-                random.seed(_SEED + 7919)
-            err_meas = []
-            for _ in range(10):
-                sample_error = 0; sample_norm = 0
-                for i in range(err_sample_size):
-                    index = tuple([random.randint(0, dims[j] - 1) for j in range(len(dims))])
-                    a = tensor_entries_glob([np.array(index)])[0]
-                    b = Core_to_Tensor_Value(cores, tuple(index))
-                    sample_error += (a - b) ** 2; sample_norm += a ** 2
-                err_meas.append((sample_error ** 0.5) / (sample_norm ** 0.5))
+        cores = cross.build_cores()
+        cores = _prof_comm('core', world, lambda: world.bcast(cores, root=0))
+        err_meas = sampled_error(cores, dims, err_sample_size, world, _SEED)
         _PROF['core']['total'] = MPI.Wtime() - tc0
 
+        if world_rank == 0 and os.environ.get("TT_CHECK_CORES") not in (None, "", "0"):
+            # compare with the serial Version 3 routine on the same pivot sets
+            I_row_global = [[Large_ravel(ip, dims[:k + 1]) for ip in cross.Ipiv[k]] for k in range(len(dims) - 1)]
+            I_col_global = [[Large_ravel(jp, dims[k + 1:]) for jp in cross.Jpiv[k]] for k in range(len(dims) - 1)]
+            ref, _ = Low_Access_Core_Extract_Update(tensor_entries_glob, dims, _new_entry_cache(dims), I_row_global, I_col_global)
+            dev = [float(np.max(np.abs(c - r)) / max(np.max(np.abs(r)), 1e-300)) for c, r in zip(cores, ref)]
+            print('CHECK cores vs serial Version 3 routine: max relative deviation per core', ' '.join('%.1e' % x for x in dev))
+
         # ---- per-rank report ----
-        area = cross.tile_area()
         fetched = sum(u.fetched for u in cross.unfs)
         rows = world.gather((world_rank, _PROF['piv']['total'], _PROF['piv']['comm'], _PROF['piv']['wait'],
                              _PROF['core']['total'], _PROF['core']['comm'], _PROF['core']['wait'], area, fetched), root=0)
@@ -988,7 +1086,10 @@ if __name__ == "__main__":
             print('*' * 65)
             print('Percent of time for full pivot searching   :', np.round(wall, 4), 'seconds')
             print('-' * 65)
-            print('Percent of time for core construction      :', np.round(_PROF['core']['total'], 4), 'seconds  (serial, rank 0)')
+            ct = np.array([r['core_total'] for r in prof]); cc = np.array([r['core_compute'] for r in prof])
+            print('Percent of time for core construction      :', np.round(ct.max(), 4), 'seconds  (cores + error sampling, all ranks)')
+            print('   [per-rank] core compute max={:.4f}s  avg={:.4f}s  comm max={:.4f}s'.format(
+                  cc.max(), cc.mean(), max(r['core_comm'] for r in prof)))
             print('-' * 65)
             print('Sampled error                              :', "{0:.3E}".format(np.min(err_meas)))
             print('-' * 65)
@@ -1020,7 +1121,8 @@ if __name__ == "__main__":
                 print('Unfolding {}: A_k is {} x {} ({} prefixes, {} suffixes); rank 0 tile {} x {}'.format(
                       k, u.nrows_glob(), u.ncols_glob(), len(u.prefixes), len(u.suffixes), len(u.rows), len(u.cols)))
             print('-' * 65)
-            print('Layout: pivot-order 2D block-cyclic, process grid {}x{} ({} ranks), block size {}'.format(pr, pc, P, nb))
+            print('Layout: pivot-order 2D block-cyclic, process grid {}x{} ({} ranks), block size {}, TT_TOL={:g}'.format(pr, pc, P, nb, _TOL))
+            print('Pivot residuals |e_0| -> |e_last| per unfolding:', ' '.join('{:.1e}->{:.1e}'.format(abs(1/u.dl[0]), abs(1/u.dl[-1])) for u in cross.unfs))
             print('*' * 65)
             print('Size', dims)
             print('*' * 65)

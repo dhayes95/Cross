@@ -57,4 +57,6 @@ keeping the same process grid and row/column communicators.
 Result: on one node with 64 ranks, 20-55x faster pivot search than Version 3 at
 comparable sampled error, with the busiest rank within 2-10% of the average and memory
 spread evenly (no hot rank). The approximation now depends on the process grid rather
-than on a block grid. Core construction is still serial on rank 0 in this prototype.
+than on a block grid. The TT cores come out of the stored cross factors by one small
+triangular solve per rank (no tensor evaluation, no communication beyond a gather), so core
+construction takes 0.1-0.2 s where the serial routine took seconds.
