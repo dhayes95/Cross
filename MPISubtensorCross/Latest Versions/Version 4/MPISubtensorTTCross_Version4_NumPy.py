@@ -23,6 +23,7 @@ import time
 import random
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from mpi4py import MPI
 
 TENSOR_KIND = "hilbert"     # CHANGE THIS: "hilbert" | "maxwell4" | "maxwell6"
@@ -773,9 +774,13 @@ def sampled_error(cores, dims, nsamples, world, seed, reps=10):
 
 
 class PivotOrderCross:
-    def __init__(self, dims, pr, pc, nb, data, world, seed, tol=0.0):
+    def __init__(self, dims, pr, pc, nb, data, world, seed, tol=0.0, nthreads=1):
         self.dims = [int(x) for x in dims]
         self.tol = tol                 # stop an unfolding when |pivot residual| < tol*|first residual|
+        # Threads for the per-unfolding local work of a round (fetch, factor
+        # recurrences, rook search).  MPI is only ever called from the main
+        # thread.  Results are identical for any thread count.
+        self.pool = ThreadPoolExecutor(max_workers=nthreads) if nthreads > 1 else None
         self.d = len(dims)
         self.pr, self.pc, self.nb = pr, pc, nb
         self.world = world
@@ -815,6 +820,13 @@ class PivotOrderCross:
         unf.dl = np.append(unf.dl, 1.0 / e)
         unf.piv_rows.append(int(i)); unf.piv_cols.append(int(j))
 
+    def _map(self, fn, items):
+        """fn over items, in order; threaded when a pool exists and there is more than one item."""
+        items = list(items)
+        if self.pool is not None and len(items) > 1:
+            return list(self.pool.map(fn, items))
+        return [fn(x) for x in items]
+
     def exchange_segments(self, want):
         """Pivot segments for every unfolding k in want = {k: (i, j)}, with one
         allgather per group for all unfoldings together.
@@ -850,55 +862,69 @@ class PivotOrderCross:
         growing.  Columns first (their factors need the pivot rows, all of
         which exist), then the new rows over all columns (their factors need
         the pivot columns, all of which exist).  Whether anything is pending
-        is the same for every member of a group, so the collectives match."""
-        pend = {}
-        for k in ks:
+        is the same for every member of a group, so the collectives match.
+        The fetches and recurrences of different unfoldings are independent
+        and run on the thread pool when one is configured."""
+        def col_fetch(k):
             unf = self.unfs[k]
-            if unf.nsuf_done < len(unf.suffixes):
-                cols_new = np.concatenate([unf.my_new_cols(s) for s in range(unf.nsuf_done, len(unf.suffixes))])
-                unf.nsuf_done = len(unf.suffixes)
-                if cols_new.size:
-                    Anew = unf.fetch_block(self.data, unf.rows, cols_new)
-                    mine = [(m, Anew[unf.lr(im), :]) for m, im in enumerate(unf.piv_rows) if unf.owner_row(im) == self.my_pr]
-                    pend[k] = (cols_new, Anew, mine)
-        if pend:
-            allm = _prof_comm('piv', self.col_comm, lambda: self.col_comm.allgather({k: v[2] for k, v in pend.items()}))
-            for k, (cols_new, Anew, _) in pend.items():
-                unf = self.unfs[k]; l = len(unf.dl)
-                Ap = np.empty((l, cols_new.size))
-                for dct in allm:
-                    for m, rowv in dct.get(k, ()):
-                        Ap[m, :] = rowv
-                Vnew = np.empty((l, cols_new.size))
-                for m in range(l):
-                    Vnew[m, :] = Ap[m, :] - (unf.dl[:m] * unf.Qm[:m, m]) @ Vnew[:m, :]
-                unf.cols = np.concatenate((unf.cols, cols_new))
-                unf.A.add_cols(Anew)
-                unf.V.add_cols(Vnew)
-        pend = {}
-        for k in ks:
+            if unf.nsuf_done >= len(unf.suffixes):
+                return None
+            cols_new = np.concatenate([unf.my_new_cols(si) for si in range(unf.nsuf_done, len(unf.suffixes))])
+            unf.nsuf_done = len(unf.suffixes)
+            if cols_new.size == 0:
+                return None
+            Anew = unf.fetch_block(self.data, unf.rows, cols_new)
+            mine = [(m, Anew[unf.lr(im), :]) for m, im in enumerate(unf.piv_rows) if unf.owner_row(im) == self.my_pr]
+            return (k, cols_new, Anew, mine)
+
+        def col_apply(item):
+            k, cols_new, Anew, _ = item
+            unf = self.unfs[k]; l = len(unf.dl)
+            Ap = np.empty((l, cols_new.size))
+            for dct in allm:
+                for m, rowv in dct.get(k, ()):
+                    Ap[m, :] = rowv
+            Vnew = np.empty((l, cols_new.size))
+            for m in range(l):
+                Vnew[m, :] = Ap[m, :] - (unf.dl[:m] * unf.Qm[:m, m]) @ Vnew[:m, :]
+            unf.cols = np.concatenate((unf.cols, cols_new))
+            unf.A.add_cols(Anew)
+            unf.V.add_cols(Vnew)
+
+        def row_fetch(k):
             unf = self.unfs[k]
-            if unf.npre_done < len(unf.prefixes):
-                rows_new = np.concatenate([unf.my_new_rows(p) for p in range(unf.npre_done, len(unf.prefixes))])
-                unf.npre_done = len(unf.prefixes)
-                if rows_new.size:
-                    Anew = unf.fetch_block(self.data, rows_new, unf.cols)
-                    mine = [(m, Anew[:, unf.lc(jm)]) for m, jm in enumerate(unf.piv_cols) if unf.owner_col(jm) == self.my_pc]
-                    pend[k] = (rows_new, Anew, mine)
+            if unf.npre_done >= len(unf.prefixes):
+                return None
+            rows_new = np.concatenate([unf.my_new_rows(p) for p in range(unf.npre_done, len(unf.prefixes))])
+            unf.npre_done = len(unf.prefixes)
+            if rows_new.size == 0:
+                return None
+            Anew = unf.fetch_block(self.data, rows_new, unf.cols)
+            mine = [(m, Anew[:, unf.lc(jm)]) for m, jm in enumerate(unf.piv_cols) if unf.owner_col(jm) == self.my_pc]
+            return (k, rows_new, Anew, mine)
+
+        def row_apply(item):
+            k, rows_new, Anew, _ = item
+            unf = self.unfs[k]; l = len(unf.dl)
+            Ap = np.empty((rows_new.size, l))
+            for dct in allm:
+                for m, colv in dct.get(k, ()):
+                    Ap[:, m] = colv
+            Unew = np.empty((rows_new.size, l))
+            for m in range(l):
+                Unew[:, m] = Ap[:, m] - Unew[:, :m] @ (unf.dl[:m] * unf.Pm[:m, m])
+            unf.rows = np.concatenate((unf.rows, rows_new))
+            unf.A.add_rows(Anew)
+            unf.U.add_rows(Unew)
+
+        pend = [x for x in self._map(col_fetch, ks) if x is not None]
         if pend:
-            allm = _prof_comm('piv', self.row_comm, lambda: self.row_comm.allgather({k: v[2] for k, v in pend.items()}))
-            for k, (rows_new, Anew, _) in pend.items():
-                unf = self.unfs[k]; l = len(unf.dl)
-                Ap = np.empty((rows_new.size, l))
-                for dct in allm:
-                    for m, colv in dct.get(k, ()):
-                        Ap[:, m] = colv
-                Unew = np.empty((rows_new.size, l))
-                for m in range(l):
-                    Unew[:, m] = Ap[:, m] - Unew[:, :m] @ (unf.dl[:m] * unf.Pm[:m, m])
-                unf.rows = np.concatenate((unf.rows, rows_new))
-                unf.A.add_rows(Anew)
-                unf.U.add_rows(Unew)
+            allm = _prof_comm('piv', self.col_comm, lambda: self.col_comm.allgather({x[0]: x[3] for x in pend}))
+            self._map(col_apply, pend)
+        pend = [x for x in self._map(row_fetch, ks) if x is not None]
+        if pend:
+            allm = _prof_comm('piv', self.row_comm, lambda: self.row_comm.allgather({x[0]: x[3] for x in pend}))
+            self._map(row_apply, pend)
 
     # ---- phases ----
     def initialise(self):
@@ -927,12 +953,10 @@ class PivotOrderCross:
         segments are exchanged together.  Returns the unfoldings that gained
         a pivot."""
         self.sync_all(active)
-        cands = {}
-        for k in active:
-            unf = self.unfs[k]; l = len(unf.dl)
-            if unf.nrows_glob() <= l or unf.ncols_glob() <= l:
-                continue
-            cands[k] = local_search(unf, self.rngs[k])
+        searchable = [k for k in active
+                      if self.unfs[k].nrows_glob() > len(self.unfs[k].dl) and self.unfs[k].ncols_glob() > len(self.unfs[k].dl)]
+        found = self._map(lambda k: local_search(self.unfs[k], self.rngs[k]), searchable)
+        cands = dict(zip(searchable, found))
         allc = _prof_comm('piv', self.world, lambda: self.world.allgather(cands))
         winners = {}
         for k in active:
@@ -1073,6 +1097,7 @@ if __name__ == "__main__":
     _PROF_MAXRANKS = int(os.environ.get("TT_PROFILE_RANKS", "16"))
     _PROF_OUT = os.environ.get("TT_PROFILE_OUT")
     _TOL = float(os.environ.get("TT_TOL", "0"))
+    _THREADS = int(os.environ.get("TT_THREADS", "1"))
 
     reason = None
     if pr * pc != P:
@@ -1091,7 +1116,7 @@ if __name__ == "__main__":
             print('starting run', ll)
         world.Barrier()
         t0 = MPI.Wtime()
-        cross = PivotOrderCross(dims, pr, pc, nb, data, world, _SEED, _TOL)
+        cross = PivotOrderCross(dims, pr, pc, nb, data, world, _SEED, _TOL, _THREADS)
         cross.run(rs)
         t1 = MPI.Wtime()
         _PROF['piv']['total'] = t1 - t0
@@ -1172,7 +1197,7 @@ if __name__ == "__main__":
                       k, u.nrows_glob(), u.ncols_glob(), len(u.prefixes), len(u.suffixes), len(u.rows), len(u.cols)))
             print('-' * 65)
             print('Layout: pivot-order 2D block-cyclic, process grid {}x{} ({} ranks), block size {}, TT_TOL={:g}'.format(pr, pc, P, nb, _TOL))
-            print('Dimension-parallel rounds:', cross.rounds, ' (all active unfoldings searched per round, collectives fused)')
+            print('Dimension-parallel rounds:', cross.rounds, ' (all active unfoldings searched per round, collectives fused; TT_THREADS={}, OMP_NUM_THREADS={})'.format(_THREADS, os.environ.get('OMP_NUM_THREADS', 'unset')))
             print('Pivot residuals |e_0| -> |e_last| per unfolding:', ' '.join('{:.1e}->{:.1e}'.format(abs(1/u.dl[0]), abs(1/u.dl[-1])) for u in cross.unfs))
             print('*' * 65)
             print('Size', dims)

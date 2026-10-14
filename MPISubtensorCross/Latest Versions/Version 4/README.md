@@ -106,6 +106,15 @@ This is the communication pattern analysed in the paper, with the subtensor tile
 replaced by `|I_{k-1}| n_k / p_r` and `n_{k+1} |J_{k+1}| / p_c`, and with the per-pivot
 messages of all unfoldings batched.
 
+**Threads inside a rank (`TT_THREADS=n`).** The local work of a round - strip fetches,
+factor recurrences and rook searches of the different unfoldings - is independent across
+unfoldings, so it can also run on a thread pool inside each rank while MPI stays on the
+main thread. Results are bit-identical for any thread count. Whether it helps depends on
+whether the work releases the Python GIL: tensor evaluation on large index arrays and the
+BLAS calls do, the many small NumPy calls of the rook search do not. `OMP_NUM_THREADS`
+is the other, independent knob: it threads the BLAS inside each call. See *Measured
+behaviour* for what each buys.
+
 ## Core construction
 
 The TT core of unfolding k is the interpolation matrix `W_k = A_k(:,J_k) A_k(I_k,J_k)^{-1}`
@@ -244,6 +253,32 @@ The saving grows with the number of unfoldings, as it should: 7 unfoldings' coll
 are fused in 8D, 3 in 4D. Sampled errors are within the usual spread (e.g. 8D 7.3e-8 vs
 7.0e-8, Hilbert 2048^4 1.7e-8 vs 2.4e-8) and the cores still agree with the serial routine
 to `cond(A(I,J))·eps`.
+
+Threads inside a rank, same node (128 cores / 256 hardware threads), `TT_TOL=1e-13` for the
+Maxwellian. "t" is `TT_THREADS`, "o" is `OMP_NUM_THREADS`; every run gives the same
+sampled error for all settings.
+
+| case | 64 ranks (4 hw threads each): t1 / t=d-1 / o4 | 16 ranks (16 each): t1 / t=d-1 / o16 |
+| --- | --- | --- |
+| Maxwellian 6D (1600,800,...) | 0.354 / 0.385 / 0.347 s | 0.806 / **0.485** / 0.838 s |
+| Maxwellian 6D (3200,1600,...) | 1.36 / 1.82 / 1.37 s | - |
+| Hilbert 8D 256^8 | 0.169 / 0.196 / 0.184 s | 0.324 / **0.205** / 0.326 s |
+| Hilbert 4D (2048^4 at 64, 1024^4 at 16) | 2.58 / 2.64 / 2.63 s | 1.01 / 1.13 / 1.02 s |
+
+What this says:
+
+* **With the node full of ranks, threads do not help and can hurt** (up to 34% slower
+  for the large Maxwellian): the cores are already busy, and the threads only add
+  contention for them and for memory bandwidth.
+* **With cores to spare they help where the GIL is released**: 1.6-1.7x for the
+  Maxwellian (expensive entry evaluation on large arrays) and 8D Hilbert (seven
+  unfoldings) at 16 ranks. They never help the 4D Hilbert case, whose local work is the
+  small-op rook search.
+* **BLAS threads do nothing** at any rank count: the matvecs and solves are too small.
+* **Flat MPI wins on a full node**: 64 ranks without threads beat 16 ranks with threads
+  in every case (0.354 vs 0.485 s, 0.169 vs 0.205 s). Dimension-level threading is
+  therefore not needed; `TT_THREADS` stays as an option for runs that must use fewer
+  ranks per node (memory per rank), where it recovers part of the difference.
 
 Core construction plus error sampling (20000 samples x 10) with the closed-form solve
 takes 0.06-0.19 s in all of these runs on 4-64 ranks, against 1.8-9 s for the rank-0
