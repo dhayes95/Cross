@@ -72,11 +72,39 @@ for the same reason it is in Version 3: an unfolding that has reached its rank i
 swept again, so its superblock stops growing. (An eager version fetched 12x more
 entries on the 6D Maxwellian, whose ranks are very unequal.)
 
-So per pivot: one all-process allgather of 4 scalars, one all-process broadcast of `2l`
-scalars, one row-group broadcast of a column segment, one column-group broadcast of a
-row segment; and per sweep at most one row-group and one column-group allgather of `l`
-short vectors. This is the communication pattern analysed in the paper, with the
-subtensor tile sides replaced by `|I_{k-1}| n_k / p_r` and `n_{k+1} |J_{k+1}| / p_c`.
+## Dimension parallelism
+
+The unfoldings of one round are independent: unfolding k only needs its neighbours'
+pivots from earlier rounds. Since every rank holds a tile of every `A_k`, all active
+unfoldings are processed **together** in each round and their collectives are fused:
+
+1. `sync_all`: pending columns of all unfoldings are fetched and their `V` factors
+   extended with **one** column-group allgather; then pending rows with **one** row-group
+   allgather.
+2. Every rank runs the rook search on each of its active tiles; the candidates of all
+   unfoldings go into **one** all-process allgather.
+3. For every unfolding that gained a pivot, the pivot column segment is computed by the
+   process column holding it and travels along the row group, the pivot row segment
+   down the column group: **one** allgather per group for all unfoldings. The `2l`
+   pivot-matrix scalars `V[:, j*]` and `U[i*, :]` ride along with the segments (every row
+   contains a member of the owning column and vice versa), so no separate broadcast is
+   needed.
+
+Per round that is five collectives regardless of d, where the sequential sweep needed
+about `6 (d-1)`. Within a round every unfolding searches on the state at the *start* of
+the round (Jacobi order); the earlier sequential sweep let unfolding k see unfolding
+k-1's pivot of the same round (Gauss-Seidel order). The pivots therefore differ slightly
+between the two; the sampled errors are the same to within their usual spread.
+
+The alternative reading of dimension parallelism - disjoint rank groups per unfolding, as
+in the paper's core-construction grids - was not used: every rank already participates in
+every unfolding here, and splitting the ranks by dimension would reintroduce the
+imbalance between unfoldings of very different size (`A_3` of the 6D Maxwellian is 100x
+`A_0`).
+
+This is the communication pattern analysed in the paper, with the subtensor tile sides
+replaced by `|I_{k-1}| n_k / p_r` and `n_{k+1} |J_{k+1}| / p_c`, and with the per-pivot
+messages of all unfoldings batched.
 
 ## Core construction
 
@@ -200,6 +228,22 @@ Idle wait is 5-14% of the pivot phase in every 64-rank run, against 68-97% for t
 subtensor layout in the study that motivated this version; the remaining loss at 64 ranks
 on these small problems is collective latency, not imbalance. The number of entries
 fetched does not depend on the process grid.
+
+Dimension-parallel rounds against the earlier sequential sweeps, same node, same seeds
+(pivot-search wall time; the share of the wall spent in communication plus idle wait in
+brackets):
+
+| case | ranks | sequential sweeps | fused rounds |
+| --- | --- | --- | --- |
+| Hilbert 512^4 | 4 / 16 / 64 | 0.94 / 0.28 / 0.25 s | 0.88 / 0.26 / 0.22 s (4% / 10% / 13%) |
+| Hilbert 2048^4 | 64 | 2.71 s | 2.59 s (6%) |
+| Hilbert 8D 256^8 | 64 | 0.233 s (35%) | **0.168 s** (18%) |
+| Maxwellian 6D, `TT_TOL=1e-13` | 4 / 64 | 2.99 / 0.41 s | 2.62 / 0.34 s (1.5% / 11%) |
+
+The saving grows with the number of unfoldings, as it should: 7 unfoldings' collectives
+are fused in 8D, 3 in 4D. Sampled errors are within the usual spread (e.g. 8D 7.3e-8 vs
+7.0e-8, Hilbert 2048^4 1.7e-8 vs 2.4e-8) and the cores still agree with the serial routine
+to `cond(A(I,J))·eps`.
 
 Core construction plus error sampling (20000 samples x 10) with the closed-form solve
 takes 0.06-0.19 s in all of these runs on 4-64 ranks, against 1.8-9 s for the rank-0

@@ -793,31 +793,6 @@ class PivotOrderCross:
                      for k in range(self.d - 1)]
 
     # ---- pivot bookkeeping ----
-    def add_pivot(self, unf, i, j, e):
-        """Append pivot (global row i, global col j, residual e) to unfolding unf."""
-        l = len(unf.dl)
-        pr_, pc_ = int(unf.owner_row(i)), int(unf.owner_col(j))
-        u = unf.ecol(unf.lc(j)) if self.my_pc == pc_ else None
-        u = _prof_comm('piv', self.row_comm, lambda: self.row_comm.bcast(u, root=pc_))
-        v = unf.erow(unf.lr(i)) if self.my_pr == pr_ else None
-        v = _prof_comm('piv', self.col_comm, lambda: self.col_comm.bcast(v, root=pr_))
-        if l > 0:
-            # the owner holds both the pivot row of U and the pivot column of V
-            small = None
-            if self.my_pr == pr_ and self.my_pc == pc_:
-                small = (unf.U.a[unf.lr(i), :].copy(), unf.V.a[:, unf.lc(j)].copy())
-            small = _prof_comm('piv', self.world, lambda: self.world.bcast(small, root=pr_ * self.pc + pc_))
-            q, p = small
-        else:
-            q = p = np.zeros(0)
-        Pm = np.zeros((l + 1, l + 1)); Pm[:l, :l] = unf.Pm; Pm[:l, l] = p
-        Qm = np.zeros((l + 1, l + 1)); Qm[:l, :l] = unf.Qm; Qm[:l, l] = q
-        unf.Pm, unf.Qm = Pm, Qm
-        unf.U.add_cols(u[:, None])
-        unf.V.add_rows(v[None, :])
-        unf.dl = np.append(unf.dl, 1.0 / e)
-        unf.piv_rows.append(int(i)); unf.piv_cols.append(int(j))
-
     def add_prefix(self, unf, prefix):
         """A new pivot of unfolding k-1 adds n_k rows to A_k (materialised lazily)."""
         unf.prefixes.append(tuple(prefix))
@@ -826,25 +801,73 @@ class PivotOrderCross:
         """A new pivot of unfolding k+1 adds n_{k+1} columns to A_k (materialised lazily)."""
         unf.suffixes.append(tuple(suffix))
 
-    def sync(self, unf):
-        """Bring the tile up to date with the pending prefixes and suffixes.
+    # ---- pivot bookkeeping ----
+    def _apply_pivot(self, unf, i, j, e, u, v, q, p):
+        """Record pivot (global row i, global col j, residual e) of unfolding unf
+        with its column segment u = E(rows, j), row segment v = E(i, cols), and
+        the entries of the earlier factors at the pivot, q = U[i,:], p = V[:,j]."""
+        l = len(unf.dl)
+        Pm = np.zeros((l + 1, l + 1)); Pm[:l, :l] = unf.Pm; Pm[:l, l] = p
+        Qm = np.zeros((l + 1, l + 1)); Qm[:l, :l] = unf.Qm; Qm[:l, l] = q
+        unf.Pm, unf.Qm = Pm, Qm
+        unf.U.add_cols(u[:, None])
+        unf.V.add_rows(v[None, :])
+        unf.dl = np.append(unf.dl, 1.0 / e)
+        unf.piv_rows.append(int(i)); unf.piv_cols.append(int(j))
 
-        As in Version 3 a superblock is only extended when its unfolding is
-        swept again, so an unfolding that has reached its rank stops costing
-        anything.  Columns first (their factors need the pivot rows, which are
-        all existing rows), then the new rows over all columns (their factors
-        need the pivot columns, which are all existing columns)."""
-        if unf.nsuf_done < len(unf.suffixes):
-            cols_new = np.concatenate([unf.my_new_cols(sidx) for sidx in range(unf.nsuf_done, len(unf.suffixes))])
-            unf.nsuf_done = len(unf.suffixes)
-            if cols_new.size:                    # identical for the whole column group
-                Anew = unf.fetch_block(self.data, unf.rows, cols_new)
-                l = len(unf.dl)
-                mine = [(m, Anew[unf.lr(im), :]) for m, im in enumerate(unf.piv_rows) if unf.owner_row(im) == self.my_pr]
-                allm = _prof_comm('piv', self.col_comm, lambda: self.col_comm.allgather(mine))
+    def exchange_segments(self, want):
+        """Pivot segments for every unfolding k in want = {k: (i, j)}, with one
+        allgather per group for all unfoldings together.
+
+        The column segment E(rows, j) is computed by the process column holding
+        j and travels along the ROW group, carrying V[:, j] with it; the row
+        segment E(i, cols) is computed by the process row holding i and travels
+        down the COLUMN group, carrying U[i, :].  Every row has one member of
+        the owning column and every column one member of the owning row, so
+        all four pieces reach every process."""
+        us, vs = {}, {}
+        for k, (i, j) in want.items():
+            unf = self.unfs[k]
+            if unf.owner_col(j) == self.my_pc:
+                lc = unf.lc(j); us[k] = (unf.ecol(lc), unf.V.a[:, lc].copy())
+            if unf.owner_row(i) == self.my_pr:
+                lr = unf.lr(i); vs[k] = (unf.erow(lr), unf.U.a[lr, :].copy())
+        allu = _prof_comm('piv', self.row_comm, lambda: self.row_comm.allgather(us))
+        allv = _prof_comm('piv', self.col_comm, lambda: self.col_comm.allgather(vs))
+        U, V = {}, {}
+        for dct in allu:
+            U.update(dct)
+        for dct in allv:
+            V.update(dct)
+        return U, V
+
+    def sync_all(self, ks):
+        """Bring the tiles of unfoldings ks up to date with their pending
+        prefixes and suffixes, with one column-group and one row-group
+        allgather for all of them.
+
+        Lazy as in Version 3: an unfolding that is never swept again stops
+        growing.  Columns first (their factors need the pivot rows, all of
+        which exist), then the new rows over all columns (their factors need
+        the pivot columns, all of which exist).  Whether anything is pending
+        is the same for every member of a group, so the collectives match."""
+        pend = {}
+        for k in ks:
+            unf = self.unfs[k]
+            if unf.nsuf_done < len(unf.suffixes):
+                cols_new = np.concatenate([unf.my_new_cols(s) for s in range(unf.nsuf_done, len(unf.suffixes))])
+                unf.nsuf_done = len(unf.suffixes)
+                if cols_new.size:
+                    Anew = unf.fetch_block(self.data, unf.rows, cols_new)
+                    mine = [(m, Anew[unf.lr(im), :]) for m, im in enumerate(unf.piv_rows) if unf.owner_row(im) == self.my_pr]
+                    pend[k] = (cols_new, Anew, mine)
+        if pend:
+            allm = _prof_comm('piv', self.col_comm, lambda: self.col_comm.allgather({k: v[2] for k, v in pend.items()}))
+            for k, (cols_new, Anew, _) in pend.items():
+                unf = self.unfs[k]; l = len(unf.dl)
                 Ap = np.empty((l, cols_new.size))
-                for chunk in allm:
-                    for m, rowv in chunk:
+                for dct in allm:
+                    for m, rowv in dct.get(k, ()):
                         Ap[m, :] = rowv
                 Vnew = np.empty((l, cols_new.size))
                 for m in range(l):
@@ -852,17 +875,23 @@ class PivotOrderCross:
                 unf.cols = np.concatenate((unf.cols, cols_new))
                 unf.A.add_cols(Anew)
                 unf.V.add_cols(Vnew)
-        if unf.npre_done < len(unf.prefixes):
-            rows_new = np.concatenate([unf.my_new_rows(pidx) for pidx in range(unf.npre_done, len(unf.prefixes))])
-            unf.npre_done = len(unf.prefixes)
-            if rows_new.size:                    # identical for the whole row group
-                Anew = unf.fetch_block(self.data, rows_new, unf.cols)
-                l = len(unf.dl)
-                mine = [(m, Anew[:, unf.lc(jm)]) for m, jm in enumerate(unf.piv_cols) if unf.owner_col(jm) == self.my_pc]
-                allm = _prof_comm('piv', self.row_comm, lambda: self.row_comm.allgather(mine))
+        pend = {}
+        for k in ks:
+            unf = self.unfs[k]
+            if unf.npre_done < len(unf.prefixes):
+                rows_new = np.concatenate([unf.my_new_rows(p) for p in range(unf.npre_done, len(unf.prefixes))])
+                unf.npre_done = len(unf.prefixes)
+                if rows_new.size:
+                    Anew = unf.fetch_block(self.data, rows_new, unf.cols)
+                    mine = [(m, Anew[:, unf.lc(jm)]) for m, jm in enumerate(unf.piv_cols) if unf.owner_col(jm) == self.my_pc]
+                    pend[k] = (rows_new, Anew, mine)
+        if pend:
+            allm = _prof_comm('piv', self.row_comm, lambda: self.row_comm.allgather({k: v[2] for k, v in pend.items()}))
+            for k, (rows_new, Anew, _) in pend.items():
+                unf = self.unfs[k]; l = len(unf.dl)
                 Ap = np.empty((rows_new.size, l))
-                for chunk in allm:
-                    for m, colv in chunk:
+                for dct in allm:
+                    for m, colv in dct.get(k, ()):
                         Ap[:, m] = colv
                 Unew = np.empty((rows_new.size, l))
                 for m in range(l):
@@ -870,6 +899,80 @@ class PivotOrderCross:
                 unf.rows = np.concatenate((unf.rows, rows_new))
                 unf.A.add_rows(Anew)
                 unf.U.add_rows(Unew)
+
+    # ---- phases ----
+    def initialise(self):
+        rng = random.Random(None if self.seed is None else self.seed + self.rank)
+        x, val = kickstart(self.data, self.dims, rng)
+        cand = _prof_comm('piv', self.world, lambda: self.world.allgather((abs(val), self.rank, x, val)))
+        best = max(cand, key=lambda t: (t[0], -t[1]))
+        x, e0 = best[2], best[3]
+        for k, unf in enumerate(self.unfs):
+            unf.prefixes = [tuple(x[:k])]
+            unf.suffixes = [tuple(x[k + 2:])]
+            unf.rows = unf.my_new_rows(0)
+            unf.cols = unf.my_new_cols(0)
+            unf.A.set(unf.fetch_block(self.data, unf.rows, unf.cols))
+            unf.U = Grow2D(len(unf.rows), 0); unf.V = Grow2D(0, len(unf.cols))
+            unf.npre_done = unf.nsuf_done = 1
+        Useg, Vseg = self.exchange_segments({k: (x[k], x[k + 1]) for k in range(self.d - 1)})
+        for k, unf in enumerate(self.unfs):
+            self._apply_pivot(unf, x[k], x[k + 1], e0, Useg[k][0], Vseg[k][0], Vseg[k][1], Useg[k][1])
+            self.Ipiv[k].append(tuple(x[:k + 1])); self.Jpiv[k].append(tuple(x[k + 1:]))
+
+    def round(self, active):
+        """One round of dimension-parallel pivot selection: every unfolding in
+        `active` is searched on the state at the start of the round, the
+        candidates of all unfoldings go into one allgather, and all new pivot
+        segments are exchanged together.  Returns the unfoldings that gained
+        a pivot."""
+        self.sync_all(active)
+        cands = {}
+        for k in active:
+            unf = self.unfs[k]; l = len(unf.dl)
+            if unf.nrows_glob() <= l or unf.ncols_glob() <= l:
+                continue
+            cands[k] = local_search(unf, self.rngs[k])
+        allc = _prof_comm('piv', self.world, lambda: self.world.allgather(cands))
+        winners = {}
+        for k in active:
+            best = None
+            for dct in allc:                    # ties go to the lowest rank
+                c = dct.get(k)
+                if c is not None and (best is None or c[0] > best[0]):
+                    best = c
+            if best is None:
+                continue
+            aval, val, i, j = best
+            if aval == 0.0 or aval < self.tol * abs(1.0 / self.unfs[k].dl[0]):
+                # nothing left to gain: a further pivot would make A(I,J)
+                # numerically singular and the core meaningless
+                continue
+            winners[k] = (i, j, val)
+        Useg, Vseg = self.exchange_segments({k: (w[0], w[1]) for k, w in winners.items()})
+        for k, (i, j, val) in winners.items():
+            unf = self.unfs[k]
+            self._apply_pivot(unf, i, j, val, Useg[k][0], Vseg[k][0], Vseg[k][1], Useg[k][1])
+            pidx, ik = divmod(i, unf.nk); sidx, ik1 = divmod(j, unf.nk1)
+            prefix = unf.prefixes[pidx] + (ik,)
+            suffix = (ik1,) + unf.suffixes[sidx]
+            self.Ipiv[k].append(prefix); self.Jpiv[k].append(suffix)
+            if k + 1 <= self.d - 2:
+                self.add_prefix(self.unfs[k + 1], prefix)
+            if k - 1 >= 0:
+                self.add_suffix(self.unfs[k - 1], suffix)
+        return list(winners)
+
+    def run(self, rs):
+        self.initialise()
+        rs = list(rs)
+        self.rounds = 0
+        for _ in range(max(rs) - 1):
+            active = [k for k in range(len(rs)) if rs[k] > 1]
+            for k in active:
+                rs[k] -= 1
+            self.round(active)
+            self.rounds += 1
 
     # ---- core construction ----
     def finish_rows_for_core(self, unf):
@@ -943,59 +1046,6 @@ class PivotOrderCross:
         return cores if self.rank == 0 else None
 
     # ---- phases ----
-    def initialise(self):
-        rng = random.Random(None if self.seed is None else self.seed + self.rank)
-        x, val = kickstart(self.data, self.dims, rng)
-        cand = _prof_comm('piv', self.world, lambda: self.world.allgather((abs(val), self.rank, x, val)))
-        best = max(cand, key=lambda t: (t[0], -t[1]))
-        x, e0 = best[2], best[3]
-        for k, unf in enumerate(self.unfs):
-            unf.prefixes = [tuple(x[:k])]
-            unf.suffixes = [tuple(x[k + 2:])]
-            unf.rows = unf.my_new_rows(0)
-            unf.cols = unf.my_new_cols(0)
-            unf.A.set(unf.fetch_block(self.data, unf.rows, unf.cols))
-            unf.U = Grow2D(len(unf.rows), 0); unf.V = Grow2D(0, len(unf.cols))
-            unf.npre_done = unf.nsuf_done = 1
-            self.add_pivot(unf, x[k], x[k + 1], e0)
-            self.Ipiv[k].append(tuple(x[:k + 1])); self.Jpiv[k].append(tuple(x[k + 1:]))
-
-    def sweep(self, k):
-        unf = self.unfs[k]
-        l = len(unf.dl)
-        if unf.nrows_glob() <= l or unf.ncols_glob() <= l:
-            return False
-        self.sync(unf)
-        cand = local_search(unf, self.rngs[k])
-        allc = _prof_comm('piv', self.world, lambda: self.world.allgather(cand))
-        best = max(range(len(allc)), key=lambda r: (allc[r][0], -r))
-        aval, val, i, j = allc[best]
-        if aval == 0.0 or aval < self.tol * abs(1.0 / unf.dl[0]):
-            # nothing left to gain: a further pivot would make A(I,J) numerically
-            # singular and the core W = A(:,J) A(I,J)^{-1} meaningless
-            return False
-        self.add_pivot(unf, i, j, val)
-        pidx, ik = divmod(i, unf.nk); sidx, ik1 = divmod(j, unf.nk1)
-        prefix = unf.prefixes[pidx] + (ik,)
-        suffix = (ik1,) + unf.suffixes[sidx]
-        self.Ipiv[k].append(prefix); self.Jpiv[k].append(suffix)
-        if k + 1 <= self.d - 2:
-            self.add_prefix(self.unfs[k + 1], prefix)
-        if k - 1 >= 0:
-            self.add_suffix(self.unfs[k - 1], suffix)
-        return True
-
-    def run(self, rs):
-        self.initialise()
-        rs = list(rs)
-        sweeps = []
-        for _ in range(max(rs)):
-            for k in range(len(rs)):
-                if rs[k] > 1:
-                    sweeps.append(k); rs[k] -= 1
-        for k in sweeps:
-            self.sweep(k)
-
     def tile_area(self):
         return sum(len(u.rows) * len(u.cols) for u in self.unfs)
 
@@ -1122,6 +1172,7 @@ if __name__ == "__main__":
                       k, u.nrows_glob(), u.ncols_glob(), len(u.prefixes), len(u.suffixes), len(u.rows), len(u.cols)))
             print('-' * 65)
             print('Layout: pivot-order 2D block-cyclic, process grid {}x{} ({} ranks), block size {}, TT_TOL={:g}'.format(pr, pc, P, nb, _TOL))
+            print('Dimension-parallel rounds:', cross.rounds, ' (all active unfoldings searched per round, collectives fused)')
             print('Pivot residuals |e_0| -> |e_last| per unfolding:', ' '.join('{:.1e}->{:.1e}'.format(abs(1/u.dl[0]), abs(1/u.dl[-1])) for u in cross.unfs))
             print('*' * 65)
             print('Size', dims)
