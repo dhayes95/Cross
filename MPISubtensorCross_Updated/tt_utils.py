@@ -681,6 +681,10 @@ class Unfolding:
         self.Pm = np.zeros((0, 0))                 # Pm[m,l] = v_m(j_l), m\<l
         self.Qm = np.zeros((0, 0))                 # Qm[m,l] = u_m(i_l), m\<l
         self.fetched = 0                           # entries evaluated/fetched
+        # tensor-coordinate parts of the local rows (prefix, i_k) and columns
+        # (i_k+1, suffix), kept so a scan builds its index array by one copy
+        self.rowc = np.zeros((0, k + 1), dtype=np.int64)
+        self.colc = np.zeros((0, self.d - k - 1), dtype=np.int64)
 
     # ---- layout ----
     def nrows_glob(self): return len(self.prefixes) * self.nk
@@ -712,6 +716,41 @@ class Unfolding:
             Suf = np.asarray(self.suffixes, dtype=np.int64).reshape(len(self.suffixes), d - k - 2)
             out[:, :, k + 2:] = Suf[sidx][None, :, :]
         return out.reshape(-1, d)
+
+    def row_part(self, rows):
+        rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+        pidx, ik = np.divmod(rows, self.nk)
+        out = np.empty((len(rows), self.k + 1), dtype=np.int64)
+        if self.k > 0:
+            out[:, :self.k] = np.asarray(self.prefixes, dtype=np.int64).reshape(-1, self.k)[pidx]
+        out[:, self.k] = ik
+        return out
+
+    def col_part(self, cols):
+        cols = np.asarray(cols, dtype=np.int64).reshape(-1)
+        sidx, ik1 = np.divmod(cols, self.nk1)
+        out = np.empty((len(cols), self.d - self.k - 1), dtype=np.int64)
+        out[:, 0] = ik1
+        if self.k + 2 < self.d:
+            out[:, 1:] = np.asarray(self.suffixes, dtype=np.int64).reshape(-1, self.d - self.k - 2)[sidx]
+        return out
+
+    def fetch_parts(self, rp, cp, chunk=1 << 20):
+        """Entries at every (row, column) pair of the coordinate parts rp (nr, k+1)
+        and cp (nc, d-k-1): one index array per batch, no divmod or lookups."""
+        nr, nc = len(rp), len(cp)
+        out = np.empty((nr, nc), dtype=np.float64)
+        if nr == 0 or nc == 0:
+            return out
+        step = max(1, chunk // nc)
+        for r0 in range(0, nr, step):
+            r1 = min(nr, r0 + step)
+            idx = np.empty((r1 - r0, nc, self.d), dtype=np.int64)
+            idx[:, :, :self.k + 1] = rp[r0:r1, None, :]
+            idx[:, :, self.k + 1:] = cp[None, :, :]
+            out[r0:r1] = self.data.fetch(idx.reshape(-1, self.d)).reshape(r1 - r0, nc)
+        self.fetched += out.size
+        return out
 
     def fetch_block(self, data, rows, cols, chunk=65536):
         """Evaluate a requested rectangle, never the whole local superblock.
@@ -765,11 +804,11 @@ class Unfolding:
 
     # Matrix-free residual E = A - U diag(dl) V.
     def ecol(self, lc):
-        values = self.fetch_block(self.data, self.rows, self.cols[lc:lc+1]).ravel()
+        values = self.fetch_parts(self.rowc, self.colc[lc:lc+1]).ravel()
         return values - self.U.a @ (self.dl * self.V.a[:, lc])
 
     def erow(self, lr):
-        values = self.fetch_block(self.data, self.rows[lr:lr+1], self.cols).ravel()
+        values = self.fetch_parts(self.rowc[lr:lr+1], self.colc).ravel()
         return values - (self.dl * self.U.a[lr, :]) @ self.V.a
 
     def epairs(self, lrs, lcs):
@@ -799,12 +838,10 @@ def local_search(unf, rng, sample_size=10, maxiter=10):
         i = avail_r[si]
 
         err2 = unf.erow(i)[avail_c]
-        row = unf.erow(i)
         #print(f"MPI rank {MPI.COMM_WORLD.Get_rank()}, unfolding {unf.k}, erow shape: {row.shape}", flush=True)
        
         sj = int(np.argmax(np.abs(err2)))
         j = avail_c[sj]
-        col = unf.ecol(j)
         #print(f"MPI rank {MPI.COMM_WORLD.Get_rank()}, unfolding {unf.k}, ecol shape: {col.shape}", flush=True)
         
         err1 = unf.ecol(j)[avail_r]
@@ -971,12 +1008,12 @@ class PivotOrderCross:
             unf.nsuf_done = len(unf.suffixes)
             if cols_new.size:
                 l = len(unf.dl)
+                own = [(m, im) for m, im in enumerate(unf.piv_rows) if unf.owner_row(im) == self.my_pr]
                 mine = []
-                for m, im in enumerate(unf.piv_rows):
-                    if unf.owner_row(im) == self.my_pr:
-                        val = unf.fetch_block(self.data,
-                            np.array([im], dtype=np.int64), cols_new).ravel()
-                        mine.append((m, val))
+                if own:   # all my pivot rows at the new columns, one batch
+                    cp_new = unf.col_part(cols_new)
+                    vals = unf.fetch_parts(unf.row_part([im for _, im in own]), cp_new)
+                    mine = [(m, vals[t]) for t, (m, _) in enumerate(own)]
                 allm = _prof_comm('piv', self.col_comm,
                                   lambda: self.col_comm.allgather(mine))
                 Ap = np.empty((l, cols_new.size))
@@ -989,6 +1026,7 @@ class PivotOrderCross:
                         (unf.dl[:m] * unf.Qm[:m, m]) @ Vnew[:m, :]
                     )
                 unf.cols = np.concatenate((unf.cols, cols_new))
+                unf.colc = np.concatenate((unf.colc, cp_new if own else unf.col_part(cols_new)))
                 unf.V.add_cols(Vnew)
 
         if unf.npre_done < len(unf.prefixes):
@@ -999,12 +1037,12 @@ class PivotOrderCross:
             unf.npre_done = len(unf.prefixes)
             if rows_new.size:
                 l = len(unf.dl)
+                own = [(m, jm) for m, jm in enumerate(unf.piv_cols) if unf.owner_col(jm) == self.my_pc]
                 mine = []
-                for m, jm in enumerate(unf.piv_cols):
-                    if unf.owner_col(jm) == self.my_pc:
-                        val = unf.fetch_block(self.data, rows_new,
-                            np.array([jm], dtype=np.int64)).ravel()
-                        mine.append((m, val))
+                rp_new = unf.row_part(rows_new)
+                if own:   # the new rows at all my pivot columns, one batch
+                    vals = unf.fetch_parts(rp_new, unf.col_part([jm for _, jm in own]))
+                    mine = [(m, vals[:, t]) for t, (m, _) in enumerate(own)]
                 allm = _prof_comm('piv', self.row_comm,
                                   lambda: self.row_comm.allgather(mine))
                 Ap = np.empty((rows_new.size, l))
@@ -1017,6 +1055,7 @@ class PivotOrderCross:
                         Unew[:, :m] @ (unf.dl[:m] * unf.Pm[:m, m])
                     )
                 unf.rows = np.concatenate((unf.rows, rows_new))
+                unf.rowc = np.concatenate((unf.rowc, rp_new))
                 unf.U.add_rows(Unew)
 
     def sync_all(self, ks):
@@ -1041,6 +1080,7 @@ class PivotOrderCross:
             unf.rows = unf.my_new_rows(0)
             unf.cols = unf.my_new_cols(0)
             unf.data = self.data  # Matrix-free: do not materialize the tile
+            unf.rowc = unf.row_part(unf.rows); unf.colc = unf.col_part(unf.cols)
             unf.U = Grow2D(len(unf.rows), 0); unf.V = Grow2D(0, len(unf.cols))
             unf.npre_done = unf.nsuf_done = 1
         Useg, Vseg = self.exchange_segments({k: (x[k], x[k + 1]) for k in range(self.d - 1)})
