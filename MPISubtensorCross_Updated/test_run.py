@@ -125,6 +125,16 @@ def tensor_entry(indices,dim):
     return value
 
 
+def tensor_block(rp, cp, k):
+    """Block form of the Hilbert entry for tt_cross_os2_mpi2(tensor_block_fn=...):
+    values at every combination of row parts rp (dims 0..k) and column parts
+    cp (dims k+1..d-1).  1/(1 + sum of all coordinates) splits into a row sum
+    and a column sum, so a whole scan costs O(len(rp) + len(cp)) and no full
+    multi-index is ever formed.  Leave tensor_block_fn out for a tensor without
+    such structure; the generic path then evaluates entry by entry as before."""
+    return 1.0 / (1.0 + rp.sum(1, dtype=np.int64)[:, None] + cp.sum(1, dtype=np.int64)[None, :])
+
+
 if __name__ == "__main__":
     import sys
 
@@ -180,7 +190,8 @@ if __name__ == "__main__":
         block_size=64,
         pivot_ranks=None,  # Every MPI rank participates in every unfolding
         nthreads=nthreads,
-        max_peid_ranks=mpin
+        max_peid_ranks=mpin,
+        tensor_block_fn=tensor_block if tensor_def == "Hilbert" else None,
     )
 
     comm.Barrier()

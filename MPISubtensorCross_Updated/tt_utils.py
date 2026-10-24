@@ -592,12 +592,34 @@ def Core_to_Tensor_Value(cores,index):
 
 
 class FunctionalTensor:
-    """Entries are evaluated on request; any process can evaluate any entry."""
-    def __init__(self, dims):
+    """Entries are evaluated on request; any process can evaluate any entry.
+
+    block_fn, if given, is the block form of the entry function:
+    block_fn(rp, cp, k) -> (len(rp), len(cp)) values at every combination of
+    the row parts rp (dims 0..k) and column parts cp (dims k+1..d-1).  A
+    separable function can evaluate it in O(len(rp) + len(cp)) without ever
+    forming the full multi-indices; without it the rectangle is expanded and
+    evaluated entry by entry as before."""
+    def __init__(self, dims, block_fn=None):
         self.dims = tuple(int(x) for x in dims)
+        self.block_fn = block_fn
     def fetch(self, indices):
-        """indices: (m, d) int64 -> (m,) float64"""
-        return np.asarray(tensor_entry(np.asarray(indices, dtype=np.int64)), dtype=np.float64).reshape(-1)
+        """indices: (m, d) ints -> (m,) float64"""
+        return np.asarray(tensor_entry(np.asarray(indices)), dtype=np.float64).reshape(-1)
+    def fetch_outer(self, rp, cp, k, chunk=1 << 20):
+        """Values of the rectangle rp x cp of unfolding k, shape (len(rp), len(cp))."""
+        nr, nc, d = len(rp), len(cp), len(self.dims)
+        if self.block_fn is not None:
+            return np.asarray(self.block_fn(rp, cp, k), dtype=np.float64).reshape(nr, nc)
+        out = np.empty((nr, nc), dtype=np.float64)
+        step = max(1, chunk // max(nc, 1))
+        for r0 in range(0, nr, step):
+            r1 = min(nr, r0 + step)
+            idx = np.empty((r1 - r0, nc, d), dtype=rp.dtype)
+            idx[:, :, :k + 1] = rp[r0:r1, None, :]
+            idx[:, :, k + 1:] = cp[None, :, :]
+            out[r0:r1] = self.fetch(idx.reshape(-1, d)).reshape(r1 - r0, nc)
+        return out
 
 
 class StoredTensor:
@@ -685,6 +707,10 @@ class Unfolding:
         # (i_k+1, suffix), kept so a scan builds its index array by one copy
         self.rowc = np.zeros((0, k + 1), dtype=np.int64)
         self.colc = np.zeros((0, self.d - k - 1), dtype=np.int64)
+        # rows / columns not yet used as pivots, kept up to date instead of
+        # recomputed with np.isin at every search
+        self.avail_r = np.zeros(0, dtype=bool)
+        self.avail_c = np.zeros(0, dtype=bool)
 
     # ---- layout ----
     def nrows_glob(self): return len(self.prefixes) * self.nk
@@ -737,18 +763,11 @@ class Unfolding:
 
     def fetch_parts(self, rp, cp, chunk=1 << 20):
         """Entries at every (row, column) pair of the coordinate parts rp (nr, k+1)
-        and cp (nc, d-k-1): one index array per batch, no divmod or lookups."""
+        and cp (nc, d-k-1), through the data layer (block form if it has one)."""
         nr, nc = len(rp), len(cp)
-        out = np.empty((nr, nc), dtype=np.float64)
         if nr == 0 or nc == 0:
-            return out
-        step = max(1, chunk // nc)
-        for r0 in range(0, nr, step):
-            r1 = min(nr, r0 + step)
-            idx = np.empty((r1 - r0, nc, self.d), dtype=np.int64)
-            idx[:, :, :self.k + 1] = rp[r0:r1, None, :]
-            idx[:, :, self.k + 1:] = cp[None, :, :]
-            out[r0:r1] = self.data.fetch(idx.reshape(-1, self.d)).reshape(r1 - r0, nc)
+            return np.empty((nr, nc), dtype=np.float64)
+        out = self.data.fetch_outer(rp, cp, self.k, chunk)
         self.fetched += out.size
         return out
 
@@ -821,8 +840,8 @@ def local_search(unf, rng, sample_size=10, maxiter=10):
     """Greedy rook search on this process's tile, excluding pivot rows/columns.
     Same scheme as Version 3's Low_Access_MPIGreedy_Search_PivV2, run on the
     cyclic tile instead of a subtensor.  Returns (|E|, E, global row, global col)."""
-    avail_r = np.flatnonzero(~np.isin(unf.rows, unf.piv_rows))
-    avail_c = np.flatnonzero(~np.isin(unf.cols, unf.piv_cols))
+    avail_r = np.flatnonzero(unf.avail_r)
+    avail_c = np.flatnonzero(unf.avail_c)
     if avail_r.size == 0 or avail_c.size == 0:
         return (0.0, 0.0, -1, -1)
     s = min(sample_size, avail_r.size, avail_c.size)
@@ -958,6 +977,10 @@ class PivotOrderCross:
         unf.V.add_rows(v[None, :])
         unf.dl = np.append(unf.dl, 1.0 / e)
         unf.piv_rows.append(int(i)); unf.piv_cols.append(int(j))
+        if unf.owner_row(i) == self.my_pr:
+            unf.avail_r[unf.lr(i)] = False
+        if unf.owner_col(j) == self.my_pc:
+            unf.avail_c[unf.lc(j)] = False
 
     def _map(self, fn, items):
         """fn over items, in order; threaded when a pool exists and there is more than one item."""
@@ -1027,6 +1050,7 @@ class PivotOrderCross:
                     )
                 unf.cols = np.concatenate((unf.cols, cols_new))
                 unf.colc = np.concatenate((unf.colc, cp_new if own else unf.col_part(cols_new)))
+                unf.avail_c = np.concatenate((unf.avail_c, np.ones(cols_new.size, dtype=bool)))
                 unf.V.add_cols(Vnew)
 
         if unf.npre_done < len(unf.prefixes):
@@ -1056,6 +1080,7 @@ class PivotOrderCross:
                     )
                 unf.rows = np.concatenate((unf.rows, rows_new))
                 unf.rowc = np.concatenate((unf.rowc, rp_new))
+                unf.avail_r = np.concatenate((unf.avail_r, np.ones(rows_new.size, dtype=bool)))
                 unf.U.add_rows(Unew)
 
     def sync_all(self, ks):
@@ -1081,6 +1106,7 @@ class PivotOrderCross:
             unf.cols = unf.my_new_cols(0)
             unf.data = self.data  # Matrix-free: do not materialize the tile
             unf.rowc = unf.row_part(unf.rows); unf.colc = unf.col_part(unf.cols)
+            unf.avail_r = np.ones(len(unf.rows), dtype=bool); unf.avail_c = np.ones(len(unf.cols), dtype=bool)
             unf.U = Grow2D(len(unf.rows), 0); unf.V = Grow2D(0, len(unf.cols))
             unf.npre_done = unf.nsuf_done = 1
         Useg, Vseg = self.exchange_segments({k: (x[k], x[k + 1]) for k in range(self.d - 1)})
@@ -1192,6 +1218,7 @@ def tt_cross_os2_mpi2(
     pivot_ranks=None,
     max_peid_ranks=None,
     nthreads=None,
+    tensor_block_fn=None,
 ):
     """
     Collective MPI TT-Cross: all pivot ranks share every unfolding.
@@ -1266,7 +1293,7 @@ def tt_cross_os2_mpi2(
     _PROFILE_SYNC = os.environ.get("TT_PROFILE") not in (None, "", "0")
     _PROF_MAXRANKS = int(os.environ.get("TT_PROFILE_RANKS", "16"))
     _PROF_OUT = os.environ.get("TT_PROFILE_OUT")
-    data = FunctionalTensor(dims)
+    data = FunctionalTensor(dims, tensor_block_fn)
     dimension_times = None
     core_info = None
     cores = None
