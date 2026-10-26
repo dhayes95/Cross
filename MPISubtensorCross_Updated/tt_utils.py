@@ -25,6 +25,10 @@ Version 3; the pivot-search phase is new and is described below the helpers.
 
 import numpy as np
 import scipy as sp
+try:
+    from scipy.linalg import solve_triangular as _solve_triangular
+except ImportError:          # imported here, not at first use: the import takes ~0.2 s
+    _solve_triangular = None
 import math
 import random
 import os
@@ -673,34 +677,107 @@ def _prof_comm(phase, comm, fn):
     return out
 
 
+def _unit_upper_solve_t(W, B):
+    """Solve (I + W)^T X = B for X, W strictly upper triangular (l x l), B (l x k).
+    Same recurrence as the former per-pivot loop in PivotOrderCross.sync, in
+    one LAPACK call; results agree to rounding (relative 1e-16)."""
+    l = W.shape[0]
+    if l == 0 or B.shape[1] == 0:
+        return np.array(B, dtype=np.float64, copy=True)
+    T = W.copy(); T[np.diag_indices(l)] = 1.0
+    if _solve_triangular is not None:
+        return _solve_triangular(T, B, trans='T', lower=False, unit_diagonal=True, check_finite=False)
+    return np.linalg.solve(T.T, B)
+
+
+class GrowArr:
+    """Array that grows along axis 0 into reserved storage; .a is the live view.
+    The per-unfolding bookkeeping (row/column indices, coordinate parts, cached
+    features, availability masks) is appended to on every extension; rebuilding
+    it with np.concatenate copied ~10 MB per extension at 10^5 local rows, the
+    same cost on every rank whatever the rank count."""
+    def __init__(self, X=None, dtype=None, tail=()):
+        if X is None:
+            self.buf = np.zeros((0,) + tuple(tail), dtype=dtype); self.n = 0
+        else:
+            self.set(X)
+    @property
+    def a(self):
+        return self.buf[:self.n]
+    def set(self, X):
+        self.buf = np.array(X, copy=True); self.n = self.buf.shape[0]
+    def reserve(self, n):
+        if n > self.buf.shape[0]:
+            nb = np.empty((int(n),) + self.buf.shape[1:], dtype=self.buf.dtype)
+            nb[:self.n] = self.buf[:self.n]
+            self.buf = nb
+    def extend(self, X):
+        X = np.asarray(X, dtype=self.buf.dtype).reshape((-1,) + self.buf.shape[1:])
+        if self.n + X.shape[0] > self.buf.shape[0]:
+            self.reserve(max(self.n + X.shape[0], 2 * self.buf.shape[0]))
+        self.buf[self.n:self.n + X.shape[0]] = X; self.n += X.shape[0]
+
+
+def _grow_property(name):
+    """Property exposing GrowArr `name` as its live array (None when unset)."""
+    def get(self):
+        g = getattr(self, name)
+        return None if g is None else g.a
+    def put(self, X):
+        setattr(self, name, None if X is None else GrowArr(X))
+    return property(get, put)
+
+
 class Grow2D:
     """2D array that grows in both directions with amortised O(1) copying.
     .a is the live (n x m) view; the tile, U and V are appended to on every
-    extension, and vstack/hstack would copy the whole tile each time."""
-    def __init__(self, n=0, m=0):
-        self.buf = np.zeros((n, m)); self.n = n; self.m = m
+    extension, and vstack/hstack would copy the whole tile each time.
+
+    transposed=True keeps the storage as (m x n) and presents .a as its
+    transpose, so that appending a COLUMN writes one contiguous row of the
+    buffer.  U (rows x pivots) gains a column per pivot: in row-major storage
+    that is one strided write per local row, ~0.25 ms per pivot at 10^5 rows
+    and 5x slower than the contiguous form; the scan's U @ w costs the same
+    either way (BLAS takes the transposed layout)."""
+    def __init__(self, n=0, m=0, transposed=False):
+        self.t = transposed
+        self.buf = np.zeros((m, n) if transposed else (n, m)); self.n = n; self.m = m
     @property
     def a(self):
-        return self.buf[:self.n, :self.m]
+        return self.buf[:self.m, :self.n].T if self.t else self.buf[:self.n, :self.m]
     def set(self, X):
-        self.buf = np.array(X, dtype=np.float64, copy=True); self.n, self.m = X.shape
+        X = np.asarray(X, dtype=np.float64)
+        self.buf = np.array(X.T if self.t else X, dtype=np.float64, copy=True); self.n, self.m = X.shape
     def reserve(self, n, m):
         self._ensure(max(n, self.n), max(m, self.m))
 
     def _ensure(self, n, m):
+        if self.t:
+            n, m = m, n
         N, M = self.buf.shape
         if n > N or m > M:
             nb = np.empty((max(n, 2 * N) if n > N else N, max(m, 2 * M) if m > M else M))
-            nb[:self.n, :self.m] = self.a        # beyond (n, m) is never read
+            if self.t:
+                nb[:self.m, :self.n] = self.buf[:self.m, :self.n]   # beyond (n, m) is never read
+            else:
+                nb[:self.n, :self.m] = self.buf[:self.n, :self.m]
             self.buf = nb
     def add_rows(self, X):
         X = np.asarray(X, dtype=np.float64).reshape(-1, self.m)
         self._ensure(self.n + X.shape[0], self.m)
-        self.buf[self.n:self.n + X.shape[0], :self.m] = X; self.n += X.shape[0]
+        if self.t:
+            self.buf[:self.m, self.n:self.n + X.shape[0]] = X.T
+        else:
+            self.buf[self.n:self.n + X.shape[0], :self.m] = X
+        self.n += X.shape[0]
     def add_cols(self, X):
         X = np.asarray(X, dtype=np.float64).reshape(self.n, -1)
         self._ensure(self.n, self.m + X.shape[1])
-        self.buf[:self.n, self.m:self.m + X.shape[1]] = X; self.m += X.shape[1]
+        if self.t:
+            self.buf[self.m:self.m + X.shape[1], :self.n] = X.T
+        else:
+            self.buf[:self.n, self.m:self.m + X.shape[1]] = X
+        self.m += X.shape[1]
 
 
 class Unfolding:
@@ -714,10 +791,10 @@ class Unfolding:
         self.pr, self.pc, self.my_pr, self.my_pc, self.nb = pr, pc, my_pr, my_pc, nb
         self.prefixes = []        # I_{k-1} in pivot order (tuples over dims 0..k-1)
         self.suffixes = []        # J_{k+1} in pivot order (tuples over dims k+2..d-1)
-        self.rows = np.zeros(0, dtype=np.int64)   # global row indices held, ascending
-        self.cols = np.zeros(0, dtype=np.int64)
+        self._rows = GrowArr(dtype=np.int64)       # global row indices held, ascending
+        self._cols = GrowArr(dtype=np.int64)
         self.A = None                              # matrix-free: never store the dense tile
-        self.U = Grow2D()                          # u_m restricted to rows
+        self.U = Grow2D(transposed=True)           # u_m restricted to rows; a column per pivot
         self.V = Grow2D()                          # v_m restricted to cols
         self.npre_done = 0                         # prefixes whose rows are materialised
         self.nsuf_done = 0                         # suffixes whose columns are materialised
@@ -729,14 +806,29 @@ class Unfolding:
         self.fetched = 0                           # entries evaluated/fetched
         # tensor-coordinate parts of the local rows (prefix, i_k) and columns
         # (i_k+1, suffix), kept so a scan builds its index array by one copy
-        self.rowc = np.zeros((0, k + 1), dtype=np.int64)
-        self.colc = np.zeros((0, self.d - k - 1), dtype=np.int64)
+        self._rowc = GrowArr(dtype=np.int64, tail=(k + 1,))
+        self._colc = GrowArr(dtype=np.int64, tail=(self.d - k - 1,))
         # rows / columns not yet used as pivots, kept up to date instead of
         # recomputed with np.isin at every search
-        self.avail_r = np.zeros(0, dtype=bool)
-        self.avail_c = np.zeros(0, dtype=bool)
-        self.rowf = None                           # cached row / column features
-        self.colf = None                           # of a separable handle
+        self._avail_r = GrowArr(dtype=bool)
+        self._avail_c = GrowArr(dtype=bool)
+        self._rowf = None                          # cached row / column features
+        self._colf = None                          # of a separable handle
+
+    # the bookkeeping arrays as live views of their growable storage
+    rows = _grow_property("_rows"); cols = _grow_property("_cols")
+    rowc = _grow_property("_rowc"); colc = _grow_property("_colc")
+    rowf = _grow_property("_rowf"); colf = _grow_property("_colf")
+    avail_r = _grow_property("_avail_r"); avail_c = _grow_property("_avail_c")
+
+    def reserve_rows(self, n):
+        for g in (self._rows, self._rowc, self._rowf, self._avail_r):
+            if g is not None:
+                g.reserve(n)
+    def reserve_cols(self, n):
+        for g in (self._cols, self._colc, self._colf, self._avail_c):
+            if g is not None:
+                g.reserve(n)
 
     # ---- layout ----
     def nrows_glob(self): return len(self.prefixes) * self.nk
@@ -1088,16 +1180,15 @@ class PivotOrderCross:
                 for chunk in allm:
                     for m, rowv in chunk:
                         Ap[m, :] = rowv
-                Vnew = np.empty((l, cols_new.size))
-                for m in range(l):
-                    Vnew[m, :] = Ap[m, :] - (
-                        (unf.dl[:m] * unf.Qm[:m, m]) @ Vnew[:m, :]
-                    )
-                unf.cols = np.concatenate((unf.cols, cols_new))
-                unf.colc = np.concatenate((unf.colc, cp_new))
+                # Vnew[m,:] = Ap[m,:] - sum_{q<m} dl[q] Qm[q,m] Vnew[q,:]  <=>  (I + W^T) Vnew = Ap,
+                # W = dl[:,None]*Qm strictly upper: one unit-triangular solve instead of l
+                # Python-level matvecs (the loop was call-bound: ~25 us per pivot per extension)
+                Vnew = _unit_upper_solve_t(unf.dl[:, None] * unf.Qm, Ap)
+                unf._cols.extend(cols_new)
+                unf._colc.extend(cp_new)
                 if fc_new is not None:
-                    unf.colf = np.concatenate((unf.colf, fc_new))
-                unf.avail_c = np.concatenate((unf.avail_c, np.ones(cols_new.size, dtype=bool)))
+                    unf._colf.extend(fc_new)
+                unf._avail_c.extend(np.ones(cols_new.size, dtype=bool))
                 unf.V.add_cols(Vnew)
 
         if unf.npre_done < len(unf.prefixes):
@@ -1122,16 +1213,13 @@ class PivotOrderCross:
                 for chunk in allm:
                     for m, colv in chunk:
                         Ap[:, m] = colv
-                Unew = np.empty((rows_new.size, l))
-                for m in range(l):
-                    Unew[:, m] = Ap[:, m] - (
-                        Unew[:, :m] @ (unf.dl[:m] * unf.Pm[:m, m])
-                    )
-                unf.rows = np.concatenate((unf.rows, rows_new))
-                unf.rowc = np.concatenate((unf.rowc, rp_new))
+                # Unew[:,m] = Ap[:,m] - sum_{q<m} Unew[:,q] dl[q] Pm[q,m]  <=>  Unew (I + W) = Ap
+                Unew = _unit_upper_solve_t(unf.dl[:, None] * unf.Pm, Ap.T).T
+                unf._rows.extend(rows_new)
+                unf._rowc.extend(rp_new)
                 if fr_new is not None:
-                    unf.rowf = np.concatenate((unf.rowf, fr_new))
-                unf.avail_r = np.concatenate((unf.avail_r, np.ones(rows_new.size, dtype=bool)))
+                    unf._rowf.extend(fr_new)
+                unf._avail_r.extend(np.ones(rows_new.size, dtype=bool))
                 unf.U.add_rows(Unew)
 
     def sync_all(self, ks):
@@ -1159,11 +1247,12 @@ class PivotOrderCross:
             unf.rowc = unf.row_part(unf.rows); unf.colc = unf.col_part(unf.cols)
             unf.rowf = self.data.row_features(unf.rowc); unf.colf = self.data.col_features(unf.colc)
             unf.avail_r = np.ones(len(unf.rows), dtype=bool); unf.avail_c = np.ones(len(unf.cols), dtype=bool)
-            unf.U = Grow2D(len(unf.rows), 0); unf.V = Grow2D(0, len(unf.cols))
+            unf.U = Grow2D(len(unf.rows), 0, transposed=True); unf.V = Grow2D(0, len(unf.cols))
             # final sizes are known from the requested ranks: allocate once
             rows_cap = (self.rs[k - 1] if k > 0 else 1) * (-(-unf.nk // self.pr))
             cols_cap = (self.rs[k + 1] if k + 1 < self.d - 1 else 1) * (-(-unf.nk1 // self.pc))
             unf.U.reserve(rows_cap, self.rs[k]); unf.V.reserve(self.rs[k], cols_cap)
+            unf.reserve_rows(rows_cap); unf.reserve_cols(cols_cap)
             unf.npre_done = unf.nsuf_done = 1
         Useg, Vseg = self.exchange_segments({k: (x[k], x[k + 1]) for k in range(self.d - 1)})
         for k, unf in enumerate(self.unfs):
