@@ -970,10 +970,14 @@ def make_group_layout(P, ngroups, base_pr, base_pc):
 
 
 class PivotOrderCross:
-    def __init__(self, dims, pr, pc, nb, data, world, seed, tol=0.0, nthreads=1, tol_type="Relative"):
+    def __init__(self, dims, pr, pc, nb, data, world, seed, tol=0.0, nthreads=1, tol_type="Relative",
+                 search_mode="tile"):
         self.dims = [int(x) for x in dims]
         self.tol = tol
         self.tol_type = tol_type
+        if search_mode not in ("tile", "cooperative"):
+            raise ValueError("search_mode must be 'tile' or 'cooperative'")
+        self.search_mode = search_mode
         # Threads for the per-unfolding local work of a round (fetch, factor
         # recurrences, rook search).  MPI is only ever called from the main
         # thread.  Results are identical for any thread count.
@@ -1166,6 +1170,173 @@ class PivotOrderCross:
             self._apply_pivot(unf, x[k], x[k + 1], e0, Useg[k][0], Vseg[k][0], Vseg[k][1], Useg[k][1])
             self.Ipiv[k].append(tuple(x[:k + 1])); self.Jpiv[k].append(tuple(x[k + 1:]))
 
+    # ---- cooperative rook search ----
+    # The tile-local search (local_search) lets every process scan candidates
+    # of its own tile, so a rook step costs each rank (rows/p_r) * l for a
+    # column and (cols/p_c) * l for a row, and the P ranks together stream
+    # (p_r + p_c)/2 times the serial amount of U and V per step.  Here all
+    # P ranks share ONE candidate column (row) per step: the p_c ranks of a
+    # process row split that row's local rows into contiguous chunks, the
+    # column's V[:, j] (l values) comes from its owner process column through
+    # the row group, and the global argmax is two allreduces of one number per
+    # unfolding.  Work per rank is 1/P of the serial scan and the memory
+    # traffic is the serial amount.  The step sequence and stopping rule are
+    # those of local_search, so on one rank the two modes coincide.
+    def _chunk(self, n, parts, idx):
+        edges = np.linspace(0, n, parts + 1).astype(np.int64)
+        return int(edges[idx]), int(edges[idx + 1])
+
+    def _coop_argmax(self, aval, gidx, extra=None):
+        """Global argmax of per-unfolding local maxima (aval < 0: none here);
+        returns (gmax, gidx); among equal values the lowest global index wins.
+        `extra` (same shape, >= 0, nonzero on one rank only) rides along in
+        the MAX allreduce and is returned third."""
+        snd = aval if extra is None else np.stack((aval, extra))
+        rcv = np.empty_like(snd)
+        _prof_comm('piv', self.world, lambda: self.world.Allreduce(snd, rcv, op=MPI.MAX))
+        gmax = rcv if extra is None else rcv[0]
+        cand = np.where(aval >= gmax, gidx, np.iinfo(np.int64).max)
+        gi = np.empty_like(cand)
+        _prof_comm('piv', self.world, lambda: self.world.Allreduce(cand, gi, op=MPI.MIN))
+        gi[gmax < 0] = -1
+        return (gmax, gi) if extra is None else (gmax, gi, rcv[1])
+
+    def _coop_colscan(self, unf, j, vj):
+        """My chunk of the residual column E(rows_local, j); vj = V[:, j]."""
+        lo, hi = self._chunk(len(unf.rows), self.pc, self.my_pc)
+        if hi <= lo:
+            return lo, hi, np.empty(0)
+        cp = unf.col_part(np.array([j], dtype=np.int64))
+        vals = self.data.fetch_outer(unf.rowc[lo:hi], cp, unf.k, fr=unf._fr(slice(lo, hi)),
+                                     fc=self.data.col_features(cp)).ravel()
+        unf.fetched += len(vals)
+        return lo, hi, vals - unf.U.a[lo:hi, :] @ (unf.dl * vj)
+
+    def _coop_rowscan(self, unf, i, ui):
+        """My chunk of the residual row E(i, cols_local); ui = U[i, :]."""
+        lo, hi = self._chunk(len(unf.cols), self.pr, self.my_pr)
+        if hi <= lo:
+            return lo, hi, np.empty(0)
+        rp = unf.row_part(np.array([i], dtype=np.int64))
+        vals = self.data.fetch_outer(rp, unf.colc[lo:hi], unf.k, fr=self.data.row_features(rp),
+                                     fc=unf._fc(slice(lo, hi))).ravel()
+        unf.fetched += len(vals)
+        return lo, hi, vals - (unf.dl * ui) @ unf.V.a[:, lo:hi]
+
+    def coop_search(self, ks, sample_size=10, maxiter=None):
+        """Cooperative rook search of the unfoldings ks, in lockstep.  Returns
+        {k: (|e|, e, i, j, E(rows_local, j), E(i, cols_local), U[i, :], V[:, j])}
+        for every unfolding that found a candidate."""
+        if maxiter is None:
+            maxiter = _ROOK_MAXITER
+        nk = len(ks)
+        J = np.full(nk, -1, dtype=np.int64); I = np.full(nk, -1, dtype=np.int64)
+        colp, rowp = {}, {}            # t -> (lo, hi, piece, factor column/row) of the last scans
+        Ilast = np.full(nk, -1, dtype=np.int64)
+
+        def colscans(ts):
+            want = {}
+            for t in ts:
+                unf = self.unfs[ks[t]]; j = int(J[t])
+                if unf.owner_col(j) == self.my_pc:
+                    want[t] = unf.V.a[:, unf.lc(j)].copy()
+            VJ = {}
+            for d_ in _prof_comm('piv', self.row_comm, lambda: self.row_comm.allgather(want)):
+                VJ.update(d_)
+            av = np.full(nk, -1.0); gi = np.full(nk, -1, dtype=np.int64); prev = np.zeros(nk)
+            for t in ts:
+                unf = self.unfs[ks[t]]
+                lo, hi, e = self._coop_colscan(unf, int(J[t]), VJ[t])
+                colp[t] = (lo, hi, e, VJ[t])
+                if hi > lo:
+                    m = np.where(unf.avail_r[lo:hi], np.abs(e), -1.0); s_ = int(np.argmax(m))
+                    if m[s_] >= 0:
+                        av[t] = m[s_]; gi[t] = unf.rows[lo + s_]
+                    if I[t] >= 0 and unf.owner_row(int(I[t])) == self.my_pr:
+                        pos = int(unf.lr(int(I[t])))      # this column's value at the row we came from
+                        if lo <= pos < hi:
+                            prev[t] = abs(e[pos - lo])
+            return self._coop_argmax(av, gi, prev)
+
+        def rowscans(ts):
+            want = {}
+            for t in ts:
+                unf = self.unfs[ks[t]]; i = int(I[t])
+                if unf.owner_row(i) == self.my_pr:
+                    want[t] = unf.U.a[unf.lr(i), :].copy()
+            UI = {}
+            for d_ in _prof_comm('piv', self.col_comm, lambda: self.col_comm.allgather(want)):
+                UI.update(d_)
+            av = np.full(nk, -1.0); gi = np.full(nk, -1, dtype=np.int64)
+            for t in ts:
+                unf = self.unfs[ks[t]]
+                lo, hi, e = self._coop_rowscan(unf, int(I[t]), UI[t])
+                rowp[t] = (lo, hi, e, UI[t]); Ilast[t] = I[t]
+                if hi > lo:
+                    m = np.where(unf.avail_c[lo:hi], np.abs(e), -1.0); s_ = int(np.argmax(m))
+                    if m[s_] >= 0:
+                        av[t] = m[s_]; gi[t] = unf.cols[lo + s_]
+            return self._coop_argmax(av, gi)
+
+        # starting column: best of a few sampled entries of every tile
+        av = np.full(nk, -1.0); gi = np.full(nk, -1, dtype=np.int64)
+        for t, k in enumerate(ks):
+            unf = self.unfs[k]; rng = self.rngs[k]
+            ar = np.flatnonzero(unf.avail_r); ac = np.flatnonzero(unf.avail_c)
+            s_ = min(sample_size, ar.size, ac.size)
+            if s_:
+                a = ar[rng.sample(range(ar.size), s_)]; b = ac[rng.sample(range(ac.size), s_)]
+                E = np.abs(unf.epairs(a, b)); q_ = int(np.argmax(E))
+                av[t] = E[q_]; gi[t] = unf.cols[b[q_]]
+        _, J = self._coop_argmax(av, gi)
+        ts = [t for t in range(nk) if J[t] >= 0]
+        A1, In, _ = colscans(ts)
+        for t in ts:
+            I[t] = In[t]
+        ts = [t for t in ts if I[t] >= 0]
+        done = {t: False for t in ts}
+        for _ in range(maxiter):
+            act = [t for t in ts if not done[t]]
+            if not act:
+                break
+            A2, Jn = rowscans(act)                   # best column of row I[t]
+            for t in act:
+                if Jn[t] < 0:
+                    done[t] = True
+                else:
+                    J[t] = Jn[t]
+            act = [t for t in act if not done[t]]
+            A1n, In, prev = colscans(act)            # best row of column J[t]
+            for t in act:
+                if In[t] < 0:
+                    done[t] = True
+                    continue
+                I[t] = In[t]; A1[t] = A1n[t]
+                if prev[t] >= A1n[t]:                # the row we came from still tops its column
+                    done[t] = True
+        # the final row may differ from the last scanned row: scan it for its segment
+        redo = [t for t in ts if Ilast[t] != I[t]]
+        if redo:
+            rowscans(redo)
+        # signed pivot value from the rank holding row i of column j
+        ev = np.zeros(nk)
+        for t in ts:
+            unf = self.unfs[ks[t]]; i = int(I[t])
+            if unf.owner_row(i) == self.my_pr:
+                lo, hi, e, _ = colp[t]; pos = int(unf.lr(i))
+                if lo <= pos < hi:
+                    ev[t] = e[pos - lo]
+        evg = np.empty_like(ev)
+        _prof_comm('piv', self.world, lambda: self.world.Allreduce(ev, evg, op=MPI.SUM))
+        # full segments: column pieces along the row group, row pieces down the column group
+        cparts = _prof_comm('piv', self.row_comm, lambda: self.row_comm.allgather({t: colp[t][2] for t in ts}))
+        rparts = _prof_comm('piv', self.col_comm, lambda: self.col_comm.allgather({t: rowp[t][2] for t in ts}))
+        out = {}
+        for t in ts:
+            u = np.concatenate([d_[t] for d_ in cparts]); v = np.concatenate([d_[t] for d_ in rparts])
+            out[ks[t]] = (float(A1[t]), float(evg[t]), int(I[t]), int(J[t]), u, v, rowp[t][3], colp[t][3])
+        return out
+
     def round(self, active):
         """One round of dimension-parallel pivot selection: every unfolding in
         `active` is searched on the state at the start of the round, the
@@ -1175,16 +1346,26 @@ class PivotOrderCross:
         self.sync_all(active)
         searchable = [k for k in active
                       if self.unfs[k].nrows_glob() > len(self.unfs[k].dl) and self.unfs[k].ncols_glob() > len(self.unfs[k].dl)]
-        found = self._map(lambda k: local_search(self.unfs[k], self.rngs[k]), searchable)
-        cands = dict(zip(searchable, found))
-        allc = _prof_comm('piv', self.world, lambda: self.world.allgather(cands))
+        if self.search_mode == "cooperative":
+            coop = self.coop_search(searchable)
+            allc = None
+        else:
+            found = self._map(lambda k: local_search(self.unfs[k], self.rngs[k]), searchable)
+            cands = dict(zip(searchable, found))
+            allc = _prof_comm('piv', self.world, lambda: self.world.allgather(cands))
         winners = {}
+        segs = {}
         for k in active:
             best = None
-            for dct in allc:                    # ties go to the lowest rank
-                c = dct.get(k)
-                if c is not None and (best is None or c[0] > best[0]):
-                    best = c
+            if allc is None:
+                c = coop.get(k)
+                if c is not None:
+                    best = c[:4]; segs[k] = c[4:]
+            else:
+                for dct in allc:                    # ties go to the lowest rank
+                    c = dct.get(k)
+                    if c is not None and (best is None or c[0] > best[0]):
+                        best = c
             if best is None:
                 continue
             aval, val, i, j = best
@@ -1201,7 +1382,11 @@ class PivotOrderCross:
                 # numerically singular and the core meaningless
                 continue
             winners[k] = (i, j, val)
-        Useg, Vseg = self.exchange_segments({k: (w[0], w[1]) for k, w in winners.items()})
+        if allc is None:        # cooperative: the segments came with the search
+            Useg = {k: (segs[k][0], segs[k][3]) for k in winners}
+            Vseg = {k: (segs[k][1], segs[k][2]) for k in winners}
+        else:
+            Useg, Vseg = self.exchange_segments({k: (w[0], w[1]) for k, w in winners.items()})
         for k, (i, j, val) in winners.items():
             unf = self.unfs[k]
             self._apply_pivot(unf, i, j, val, Useg[k][0], Vseg[k][0], Vseg[k][1], Useg[k][1])
@@ -1273,6 +1458,7 @@ def tt_cross_os2_mpi2(
     nthreads=None,
     tensor_block_fn=None,
     gather_cores=False,
+    search_mode=None,
 ):
     """
     Collective MPI TT-Cross: all pivot ranks share every unfolding.
@@ -1294,8 +1480,15 @@ def tt_cross_os2_mpi2(
     time is reported separately as info["timings"]["core_gather"] and is not
     part of the core-construction time.
 
+    search_mode: "tile" (default; env TT_SEARCH) lets every process run the
+    rook search on its own tile and takes the best candidate; "cooperative"
+    lets all processes scan one shared candidate column / row per rook step,
+    each a 1/P slice (see PivotOrderCross.coop_search).
+
     With return_info=True, appends an info dictionary.
     """
+    if search_mode is None:
+        search_mode = os.environ.get("TT_SEARCH", "tile")
 
     if len(tensor_dim) < 2:
         raise ValueError("tensor_dim must have at least two modes")
@@ -1380,7 +1573,8 @@ def tt_cross_os2_mpi2(
         if active_pivot:
             cross = PivotOrderCross(dims, pr, pc, nb, data, pivot_comm,
                                     _SEED, tol=0.0 if tol is None else tol,
-                                    nthreads=nthreads, tol_type=tol_type)
+                                    nthreads=nthreads, tol_type=tol_type,
+                                    search_mode=search_mode)
             try:
                 cross.run(rs)
             finally:
@@ -1564,6 +1758,7 @@ def tt_cross_os2_mpi2(
             "pivot_ranks": pivot_size,
             "inactive_ranks": list(range(pivot_size, P)),
             "threads_per_rank": nthreads,
+            "search_mode": search_mode,
             "dimension_times": dimension_times,
         },
         "core_construction": core_info,
