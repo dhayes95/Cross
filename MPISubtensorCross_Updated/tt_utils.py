@@ -1272,6 +1272,7 @@ def tt_cross_os2_mpi2(
     max_peid_ranks=None,
     nthreads=None,
     tensor_block_fn=None,
+    gather_cores=False,
 ):
     """
     Collective MPI TT-Cross: all pivot ranks share every unfolding.
@@ -1283,8 +1284,15 @@ def tt_cross_os2_mpi2(
               pivot searching. All MPI ranks still participate
               in parallel TT core construction.
 
-    Returns (cores, FI, FJ) on world rank 0.
-    Other ranks return (None, None, None).
+    Returns (cores, FI, FJ) on every rank.  FI, FJ are the pivot sets.  The
+    cores are distributed as the core construction leaves them: a list of d
+    entries, entry k = (lo, hi, slab) with slab = core_k[:, lo:hi, :] on the
+    ranks that computed that slice of mode k and None elsewhere; the layout is
+    in info["core_construction"]["core_layout"] and gather_tt_cores() assembles
+    them on one rank.  With gather_cores=True that gather is done here and the
+    full cores are returned on world rank 0 (None elsewhere), as before; its
+    time is reported separately as info["timings"]["core_gather"] and is not
+    part of the core-construction time.
 
     With return_info=True, appends an info dictionary.
     """
@@ -1445,14 +1453,25 @@ def tt_cross_os2_mpi2(
             )
         )
 
-        _PROF["core"]["total"] = (
-            MPI.Wtime() - tc0
-        )
+        if _use_sliced:
+            # construction only: the slabs stay distributed, no gather inside
+            _PROF["core"]["total"] = core_info["local_time"]
+        else:
+            _PROF["core"]["total"] = MPI.Wtime() - tc0
+            # legacy routine leaves the full cores on rank 0: same distributed form
+            cores = ([(0, int(dims[k]), cores[k]) for k in range(len(dims))]
+                     if world_rank == 0 else [None] * len(dims))
 
         core_wall = world.allreduce(
             _PROF["core"]["total"],
             op=MPI.MAX
         )
+
+        gather_wall = 0.0
+        if gather_cores:
+            tg0 = MPI.Wtime()
+            cores = gather_tt_cores(cores, world, root=0)
+            gather_wall = world.allreduce(MPI.Wtime() - tg0, op=MPI.MAX)
 
     
         # ---------------------------------------------------
@@ -1551,15 +1570,11 @@ def tt_cross_os2_mpi2(
         "timings": {
             "pivot_search": _PROF["piv"]["total"],
             "core_construction": core_wall,
+            "core_gather": gather_wall,
         },
     }
-    
 
-    result = (
-        (cores, I_row_unrav, I_col_unrav)
-        if world_rank == 0
-        else (None, None, None)
-    )
+    result = (cores, I_row_unrav, I_col_unrav)
 
     # Release the pivot communicator.
     if active_pivot:
@@ -1612,23 +1627,35 @@ def _peid_row_parts(prefixes, i_slice, k):
 def peid_sliced(data, FI, FJ, tensor_dim, comm, adap_tol=None, max_peid_ranks=None,
                 return_info=False, tensor_entry=None):
     """Sliced PEID.  data: object with fetch_outer(rp, cp, k) (FunctionalTensor).
-    Returns cores on world rank 0 (None elsewhere); info on every rank."""
+
+    The cores are returned distributed, as they are computed: on every rank a
+    list of d entries, entry k being (lo, hi, slab) with slab = core_k[:, lo:hi, :]
+    when this rank computed that slice of the mode index, and None otherwise.
+    info["core_layout"][k] lists (world rank, lo, hi) of every slab of core k;
+    gather_tt_cores() assembles the full cores on one rank when they are needed
+    there.  The timings (info["construct_time"], per-rank info["local_time"])
+    cover the construction only, not any gather."""
     import time
     d = len(tensor_dim)
     n = d - 1
     world_rank = comm.Get_rank()
     world_size = comm.Get_size()
     peid_size = world_size if max_peid_ranks is None else min(int(max_peid_ranks), world_size)
-    cores = None
+    cores = [None] * d
     info = None
+    elapsed = 0.0
     if peid_size < d:                       # fewer ranks than dimensions: serial on rank 0
         if world_rank == 0:
             t0 = MPI.Wtime()
-            cores = peid_serial_fast(data, FI, FJ, tensor_dim, adap_tol)
+            full = peid_serial_fast(data, FI, FJ, tensor_dim, adap_tol)
+            elapsed = MPI.Wtime() - t0
+            cores = [(0, int(tensor_dim[k]), full[k]) for k in range(d)]
             info = {"core_group_sizes": [1] * d, "core_groups": [[0] for _ in range(d)],
                     "dimension_times": None, "dimension_active_times": None,
-                    "total_time": MPI.Wtime() - t0, "execution_mode": "serial_fast"}
+                    "total_time": elapsed, "construct_time": elapsed, "execution_mode": "serial_fast",
+                    "core_layout": [[(0, 0, int(tensor_dim[k]))] for k in range(d)]}
         info = comm.bcast(info, root=0)
+        info["local_time"] = elapsed
         info["peid_ranks"] = 1
         info["inactive_ranks"] = list(range(1, world_size))
         return (cores, info) if return_info else cores
@@ -1731,27 +1758,44 @@ def peid_sliced(data, FI, FJ, tensor_dim, comm, adap_tol=None, max_peid_ranks=No
             M = sub.bcast(M, root=0)
             slab = _solve_core(M, mat_local).reshape(M.shape[1], m, 1)
         elapsed = MPI.Wtime() - t0
-        # ---- assemble: slabs of each core to its group root, cores to rank 0
-        slabs = sub.gather(slab, root=0)
-        if srank == 0:
-            core = np.concatenate(slabs, axis=1)
-        else:
-            core = None
+        # ---- the slab stays where it was computed; only timings and the layout travel
+        lo, hi = int(edges[srank]), int(edges[srank + 1])
+        cores[gi] = (lo, hi, slab)
         tmax = sub.allreduce(elapsed, op=MPI.MAX)
-        res = pcomm.gather((gi, core, tmax, tmax - wait) if srank == 0 else None, root=0)
+        res = pcomm.gather((gi, tmax, tmax - wait) if srank == 0 else None, root=0)
+        layout = pcomm.gather((gi, world_rank, lo, hi), root=0)
         if rank == 0:
             ordered = sorted(r_ for r_ in res if r_ is not None)
-            cores = [x[1] for x in ordered]
             info = {"core_group_sizes": group_sizes, "core_groups": groups,
-                    "dimension_times": [x[2] for x in ordered],
-                    "dimension_active_times": [x[3] for x in ordered],
+                    "dimension_times": [x[1] for x in ordered],
+                    "dimension_active_times": [x[2] for x in ordered],
+                    "construct_time": max(x[1] for x in ordered),
+                    "core_layout": [[(r_, lo_, hi_) for (g_, r_, lo_, hi_) in sorted(layout) if g_ == k]
+                                    for k in range(d)],
                     "execution_mode": "sliced"}
         sub.Free()
         pcomm.Free()
     info = comm.bcast(info if world_rank == 0 else None, root=0)
+    info["local_time"] = elapsed
     info["peid_ranks"] = peid_size
     info["inactive_ranks"] = list(range(peid_size, world_size))
     return (cores, info) if return_info else cores
+
+
+def gather_tt_cores(cores_local, comm, root=0):
+    """Assemble distributed cores (the list returned by peid_sliced /
+    tt_cross_os2_mpi2: (lo, hi, slab) or None per core) on `root`.
+    Returns the list of full cores on root and None elsewhere."""
+    d = comm.bcast(len(cores_local) if comm.Get_rank() == root else None, root=root)
+    mine = [(k, e[0], e[2]) for k, e in enumerate(cores_local or []) if e is not None]
+    parts = comm.gather(mine, root=root)
+    if comm.Get_rank() != root:
+        return None
+    per = [[] for _ in range(d)]
+    for chunk in parts:
+        for k, lo, slab in chunk:
+            per[k].append((lo, slab))
+    return [np.concatenate([sl for _, sl in sorted(per[k], key=lambda x: x[0])], axis=1) for k in range(d)]
 
 
 def peid_serial_fast(data, FI, FJ, tensor_dim, adap_tol=None):

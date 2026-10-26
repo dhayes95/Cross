@@ -212,6 +212,7 @@ if __name__ == "__main__":
         nthreads=nthreads,
         max_peid_ranks=mpin,
         tensor_block_fn=tensor_block_separable if tensor_def == "Hilbert" else None,
+        gather_cores=True,   # assemble the cores on rank 0 for the error check; timed separately
     )
 
     comm.Barrier()
@@ -242,6 +243,7 @@ if __name__ == "__main__":
         print(f'TT ranks:                     {ranks}')
         print(f'Pivot search time: {info["timings"]["pivot_search"]:.6f} s')
         print(f'PEID time:         {info["timings"]["core_construction"]:.6f} s')
+        print(f'Core gather time:  {info["timings"]["core_gather"]:.6f} s   (cores to rank 0, not part of PEID time)')
         print('-'*80)
         core_times = info["core_construction"].get("dimension_times")
         if core_times is not None:
