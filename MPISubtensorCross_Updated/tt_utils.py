@@ -602,13 +602,34 @@ class FunctionalTensor:
     evaluated entry by entry as before."""
     def __init__(self, dims, block_fn=None):
         self.dims = tuple(int(x) for x in dims)
-        self.block_fn = block_fn
+        # block_fn: callable f(rp, cp, k) -> (nr, nc); or a triple
+        # (row_fn, col_fn, combine) for a separable entry: row_fn(rp) -> (nr, ...)
+        # features, col_fn(cp) -> (nc, ...) features, combine(fr, fc) -> (nr, nc).
+        # The features are cached per unfolding and only computed for new rows
+        # and columns, so a scan costs one combine.
+        self.block_fn = None
+        self.sep = None
+        if isinstance(block_fn, (tuple, list)):
+            self.sep = tuple(block_fn)
+        else:
+            self.block_fn = block_fn
+    def row_features(self, rp):
+        return self.sep[0](rp) if self.sep is not None else None
+    def col_features(self, cp):
+        return self.sep[1](cp) if self.sep is not None else None
     def fetch(self, indices):
         """indices: (m, d) ints -> (m,) float64"""
         return np.asarray(tensor_entry(np.asarray(indices)), dtype=np.float64).reshape(-1)
-    def fetch_outer(self, rp, cp, k, chunk=1 << 20):
-        """Values of the rectangle rp x cp of unfolding k, shape (len(rp), len(cp))."""
+    def fetch_outer(self, rp, cp, k, chunk=1 << 20, fr=None, fc=None):
+        """Values of the rectangle rp x cp of unfolding k, shape (len(rp), len(cp)).
+        fr / fc: cached row / column features for a separable handle."""
         nr, nc, d = len(rp), len(cp), len(self.dims)
+        if self.sep is not None:
+            if fr is None:
+                fr = self.sep[0](rp)
+            if fc is None:
+                fc = self.sep[1](cp)
+            return np.asarray(self.sep[2](fr, fc), dtype=np.float64).reshape(nr, nc)
         if self.block_fn is not None:
             return np.asarray(self.block_fn(rp, cp, k), dtype=np.float64).reshape(nr, nc)
         out = np.empty((nr, nc), dtype=np.float64)
@@ -663,11 +684,14 @@ class Grow2D:
         return self.buf[:self.n, :self.m]
     def set(self, X):
         self.buf = np.array(X, dtype=np.float64, copy=True); self.n, self.m = X.shape
+    def reserve(self, n, m):
+        self._ensure(max(n, self.n), max(m, self.m))
+
     def _ensure(self, n, m):
         N, M = self.buf.shape
         if n > N or m > M:
-            nb = np.zeros((max(n, 2 * N) if n > N else N, max(m, 2 * M) if m > M else M))
-            nb[:self.n, :self.m] = self.a
+            nb = np.empty((max(n, 2 * N) if n > N else N, max(m, 2 * M) if m > M else M))
+            nb[:self.n, :self.m] = self.a        # beyond (n, m) is never read
             self.buf = nb
     def add_rows(self, X):
         X = np.asarray(X, dtype=np.float64).reshape(-1, self.m)
@@ -711,6 +735,8 @@ class Unfolding:
         # recomputed with np.isin at every search
         self.avail_r = np.zeros(0, dtype=bool)
         self.avail_c = np.zeros(0, dtype=bool)
+        self.rowf = None                           # cached row / column features
+        self.colf = None                           # of a separable handle
 
     # ---- layout ----
     def nrows_glob(self): return len(self.prefixes) * self.nk
@@ -822,12 +848,19 @@ class Unfolding:
         return out
 
     # Matrix-free residual E = A - U diag(dl) V.
+    def _fr(self, sl=slice(None)):
+        return None if self.rowf is None else self.rowf[sl]
+    def _fc(self, sl=slice(None)):
+        return None if self.colf is None else self.colf[sl]
+
     def ecol(self, lc):
-        values = self.fetch_parts(self.rowc, self.colc[lc:lc+1]).ravel()
+        values = self.data.fetch_outer(self.rowc, self.colc[lc:lc+1], self.k, fr=self._fr(), fc=self._fc(slice(lc, lc+1))).ravel()
+        self.fetched += len(values)
         return values - self.U.a @ (self.dl * self.V.a[:, lc])
 
     def erow(self, lr):
-        values = self.fetch_parts(self.rowc[lr:lr+1], self.colc).ravel()
+        values = self.data.fetch_outer(self.rowc[lr:lr+1], self.colc, self.k, fr=self._fr(slice(lr, lr+1)), fc=self._fc()).ravel()
+        self.fetched += len(values)
         return values - (self.dl * self.U.a[lr, :]) @ self.V.a
 
     def epairs(self, lrs, lcs):
@@ -1039,9 +1072,11 @@ class PivotOrderCross:
                 l = len(unf.dl)
                 own = [(m, im) for m, im in enumerate(unf.piv_rows) if unf.owner_row(im) == self.my_pr]
                 mine = []
+                cp_new = unf.col_part(cols_new)
+                fc_new = self.data.col_features(cp_new)
                 if own:   # all my pivot rows at the new columns, one batch
-                    cp_new = unf.col_part(cols_new)
-                    vals = unf.fetch_parts(unf.row_part([im for _, im in own]), cp_new)
+                    vals = self.data.fetch_outer(unf.row_part([im for _, im in own]), cp_new, unf.k, fc=fc_new)
+                    unf.fetched += vals.size
                     mine = [(m, vals[t]) for t, (m, _) in enumerate(own)]
                 allm = _prof_comm('piv', self.col_comm,
                                   lambda: self.col_comm.allgather(mine))
@@ -1055,7 +1090,9 @@ class PivotOrderCross:
                         (unf.dl[:m] * unf.Qm[:m, m]) @ Vnew[:m, :]
                     )
                 unf.cols = np.concatenate((unf.cols, cols_new))
-                unf.colc = np.concatenate((unf.colc, cp_new if own else unf.col_part(cols_new)))
+                unf.colc = np.concatenate((unf.colc, cp_new))
+                if fc_new is not None:
+                    unf.colf = np.concatenate((unf.colf, fc_new))
                 unf.avail_c = np.concatenate((unf.avail_c, np.ones(cols_new.size, dtype=bool)))
                 unf.V.add_cols(Vnew)
 
@@ -1070,8 +1107,10 @@ class PivotOrderCross:
                 own = [(m, jm) for m, jm in enumerate(unf.piv_cols) if unf.owner_col(jm) == self.my_pc]
                 mine = []
                 rp_new = unf.row_part(rows_new)
+                fr_new = self.data.row_features(rp_new)
                 if own:   # the new rows at all my pivot columns, one batch
-                    vals = unf.fetch_parts(rp_new, unf.col_part([jm for _, jm in own]))
+                    vals = self.data.fetch_outer(rp_new, unf.col_part([jm for _, jm in own]), unf.k, fr=fr_new)
+                    unf.fetched += vals.size
                     mine = [(m, vals[:, t]) for t, (m, _) in enumerate(own)]
                 allm = _prof_comm('piv', self.row_comm,
                                   lambda: self.row_comm.allgather(mine))
@@ -1086,6 +1125,8 @@ class PivotOrderCross:
                     )
                 unf.rows = np.concatenate((unf.rows, rows_new))
                 unf.rowc = np.concatenate((unf.rowc, rp_new))
+                if fr_new is not None:
+                    unf.rowf = np.concatenate((unf.rowf, fr_new))
                 unf.avail_r = np.concatenate((unf.avail_r, np.ones(rows_new.size, dtype=bool)))
                 unf.U.add_rows(Unew)
 
@@ -1112,8 +1153,13 @@ class PivotOrderCross:
             unf.cols = unf.my_new_cols(0)
             unf.data = self.data  # Matrix-free: do not materialize the tile
             unf.rowc = unf.row_part(unf.rows); unf.colc = unf.col_part(unf.cols)
+            unf.rowf = self.data.row_features(unf.rowc); unf.colf = self.data.col_features(unf.colc)
             unf.avail_r = np.ones(len(unf.rows), dtype=bool); unf.avail_c = np.ones(len(unf.cols), dtype=bool)
             unf.U = Grow2D(len(unf.rows), 0); unf.V = Grow2D(0, len(unf.cols))
+            # final sizes are known from the requested ranks: allocate once
+            rows_cap = (self.rs[k - 1] if k > 0 else 1) * (-(-unf.nk // self.pr))
+            cols_cap = (self.rs[k + 1] if k + 1 < self.d - 1 else 1) * (-(-unf.nk1 // self.pc))
+            unf.U.reserve(rows_cap, self.rs[k]); unf.V.reserve(self.rs[k], cols_cap)
             unf.npre_done = unf.nsuf_done = 1
         Useg, Vseg = self.exchange_segments({k: (x[k], x[k + 1]) for k in range(self.d - 1)})
         for k, unf in enumerate(self.unfs):
@@ -1170,6 +1216,7 @@ class PivotOrderCross:
         return list(winners)
 
     def run(self, rs):
+        self.rs = list(rs)
         self.initialise()
 
         active = set(range(len(rs)))

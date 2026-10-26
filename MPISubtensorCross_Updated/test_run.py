@@ -135,6 +135,26 @@ def tensor_block(rp, cp, k):
     return 1.0 / (1.0 + rp.sum(1, dtype=np.int64)[:, None] + cp.sum(1, dtype=np.int64)[None, :])
 
 
+# Separable form of the same entry: tensor_block_fn=(row_fn, col_fn, combine).
+# The library caches row_fn(rp) and col_fn(cp) per unfolding, so a scan of one
+# column costs one call of combine on cached features instead of re-summing the
+# coordinate parts of every row.  Pass the plain block form (above) for a tensor
+# whose entry does not split into row and column features.
+def hilbert_row_features(rp):
+    return rp.sum(1, dtype=np.int64)
+
+
+def hilbert_col_features(cp):
+    return cp.sum(1, dtype=np.int64)
+
+
+def hilbert_combine(fr, fc):
+    return 1.0 / (1.0 + fr[:, None] + fc[None, :])
+
+
+tensor_block_separable = (hilbert_row_features, hilbert_col_features, hilbert_combine)
+
+
 if __name__ == "__main__":
     import sys
 
@@ -191,7 +211,7 @@ if __name__ == "__main__":
         pivot_ranks=None,  # Every MPI rank participates in every unfolding
         nthreads=nthreads,
         max_peid_ranks=mpin,
-        tensor_block_fn=tensor_block if tensor_def == "Hilbert" else None,
+        tensor_block_fn=tensor_block_separable if tensor_def == "Hilbert" else None,
     )
 
     comm.Barrier()
