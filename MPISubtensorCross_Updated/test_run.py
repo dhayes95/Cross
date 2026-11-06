@@ -177,8 +177,13 @@ if __name__ == "__main__":
     tensor_def = "Hilbert"
 
     tensor_dim = [2000]*8
-    sample_row = [0]*(len(tensor_dim)-1)
-    sample_col = [0]*(len(tensor_dim)-1)
+    # PEID oversampling per dimension (Algorithm 3.1 of the preprint): TT_OVERSAMPLE extra
+    # columns, TT_OVERSAMPLE_ROWS extra rows (default twice the columns), TT_PEID_RANK the
+    # output TT rank when it should exceed the pivot count (cross to a lower rank, PEID to this).
+    oversample = int(os.environ.get("TT_OVERSAMPLE", "0"))
+    sample_col = [oversample]*(len(tensor_dim)-1)
+    sample_row = [int(os.environ.get("TT_OVERSAMPLE_ROWS", 2 * oversample))]*(len(tensor_dim)-1)
+    peid_target_rank = int(os.environ["TT_PEID_RANK"]) if os.environ.get("TT_PEID_RANK") else None
     min_ranks = [1]*(len(tensor_dim)-1)
     max_ranks = [15]*(len(tensor_dim)-1)
     tolerance = 1e-15
@@ -213,6 +218,7 @@ if __name__ == "__main__":
         max_peid_ranks=mpin,
         tensor_block_fn=tensor_block_separable if tensor_def == "Hilbert" else None,
         gather_cores=True,   # assemble the cores on rank 0 for the error check; timed separately
+        peid_target_rank=peid_target_rank,
     )
 
     comm.Barrier()

@@ -763,7 +763,8 @@ class Grow2D:
                 nb[:self.n, :self.m] = self.buf[:self.n, :self.m]
             self.buf = nb
     def add_rows(self, X):
-        X = np.asarray(X, dtype=np.float64).reshape(-1, self.m)
+        X = np.asarray(X, dtype=np.float64)
+        X = X[None, :] if X.ndim == 1 else X.reshape(X.shape[0], self.m)   # explicit: reshape(-1, m) fails on empty
         self._ensure(self.n + X.shape[0], self.m)
         if self.t:
             self.buf[:self.m, self.n:self.n + X.shape[0]] = X.T
@@ -771,7 +772,8 @@ class Grow2D:
             self.buf[self.n:self.n + X.shape[0], :self.m] = X
         self.n += X.shape[0]
     def add_cols(self, X):
-        X = np.asarray(X, dtype=np.float64).reshape(self.n, -1)
+        X = np.asarray(X, dtype=np.float64)
+        X = X[:, None] if X.ndim == 1 else X.reshape(self.n, X.shape[-1])   # rank may own zero rows
         self._ensure(self.n, self.m + X.shape[1])
         if self.t:
             self.buf[self.m:self.m + X.shape[1], :self.n] = X.T
@@ -1548,6 +1550,7 @@ def tt_cross_os2_mpi2(
     tensor_block_fn=None,
     gather_cores=False,
     search_mode=None,
+    peid_target_rank=None,
 ):
     """
     Collective MPI TT-Cross: all pivot ranks share every unfolding.
@@ -1710,16 +1713,28 @@ def tt_cross_os2_mpi2(
             if sample_col is None
             else list(map(int, sample_col))
         )
+        # PEID oversampling: sample_col extra columns per unfolding give the basis
+        # up to r + p directions; sample_row extra (nested) rows condition the
+        # oblique projections.  Rows default to twice the columns, below which
+        # an output rank above the pivot count is unreliable.  peid_target_rank
+        # asks for that output rank (<= r + sample_col); adap_toler truncates it.
+        if sample_row is None and sample_col is not None:
+            sample_row_test = [2 * c for c in sample_col_test]
 
         # PEID uses the full MPI communicator.
-        # TT_PEID=sliced (default): rows split by mode index, local solves, block-form
-        # extraction; needs no extra sampling rows/columns.  TT_PEID=legacy: previous routine.
-        _use_sliced = (os.environ.get("TT_PEID", "sliced") == "sliced"
-                       and not any(sample_row_test) and not any(sample_col_test))
+        # TT_PEID=sliced (default): core_construct.peid_par_sliced, Algorithm 3.1 with the
+        # oversampling sets, mode index split per dimension group, block-form extraction,
+        # cores left distributed.  TT_PEID=legacy: the previous routine (cores on rank 0).
+        # TT_PEID=seq: core_construct.peid_seq_sliced (Algorithm 3.2); TT_PEID=two_sided:
+        # peid_par2_sliced (Algorithm 3.3).
+        _peid_mode = os.environ.get("TT_PEID", "sliced")
+        _use_sliced = _peid_mode != "legacy"
         if _use_sliced:
-            cores, core_info = peid_sliced(data, I_row_unrav, I_col_unrav, dims, world,
-                                           adap_tol=adap_toler, max_peid_ranks=max_peid_ranks,
-                                           return_info=True)
+            import core_construct as _cc
+            _peid_fn = {"seq": _cc.peid_seq_sliced, "two_sided": _cc.peid_par2_sliced}.get(_peid_mode, _cc.peid_par_sliced)
+            cores, core_info = _peid_fn(data, I_row_unrav, I_col_unrav, sample_row_test, sample_col_test,
+                                        dims, world, adap_tol=adap_toler, max_peid_ranks=max_peid_ranks,
+                                        return_info=True, seed=seed, target_rank=peid_target_rank)
         else:
             cores, core_info = (
             peid_par_ltr_adap_parallel(
@@ -1870,200 +1885,13 @@ def tt_cross_os2_mpi2(
 # ==========================================================================
 # PEID core construction, sliced along the mode index
 # ==========================================================================
-# Same algorithm as peid_par_ltr_adap / peid_par_ltr_adap_parallel: for each
-# dimension i the matrix of the unfolding's pivot columns,
-#     mat_i = X( uFI[i-1] x n_i , uFJ[i] )        (rows (p, i_k), p-major)
-# is QR-factored, the left singular vectors uj_i = Q U are formed, and the core
-# is A_i = M_i^{-1} reshape(uj_i, [R, n_i r_i]) with M_i = uj_{i-1}[I[i-1], :].
-#
-# What changes is the distribution and three costs that did not scale:
-#   * the rows of mat_i are split over the ranks of dimension i's group by
-#     slices of the mode index i_k (all prefixes), so that after the TSQR the
-#     local rows of uj_i are exactly the local columns of reshape(uj_i) and the
-#     solve M_i^{-1} B is local: no gather of Q, no serial solve on one rank;
-#   * the square system is solved with an LU solve instead of np.linalg.lstsq
-#     (4.1 s -> 0.37 s for 30 x 30 with 491k right-hand sides);
-#   * only the r x r matrix uj_i[I[i], :] travels to the next group, not uj_i;
-#   * the block is extracted through the data layer's block form when the
-#     tensor provides one.
-# The TT tensor is the same up to rounding (columns of uj_i may change sign,
-# which cancels in the contraction); cores are gathered to world rank 0.
-# Falls back to the previous routine when extra sampling rows/columns are
-# requested (sample_row / sample_col nonzero), which this path does not handle.
-
-def _solve_core(M, B):
-    """M^{-1} B: LU solve when M is square, least squares otherwise."""
-    if M.shape[0] == M.shape[1]:
-        return np.linalg.solve(M, B)
-    return np.linalg.lstsq(M, B, rcond=None)[0]
-
-
-def _peid_row_parts(prefixes, i_slice, k):
-    """Row parts (p, i_k) for every prefix p and i_k in i_slice, p-major."""
-    P = np.asarray(prefixes, dtype=np.int64).reshape(len(prefixes), k)
-    m = len(i_slice)
-    rp = np.empty((len(prefixes) * m, k + 1), dtype=np.int64)
-    rp[:, :k] = np.repeat(P, m, axis=0)
-    rp[:, k] = np.tile(np.asarray(i_slice, dtype=np.int64), len(prefixes))
-    return rp
-
-
 def peid_sliced(data, FI, FJ, tensor_dim, comm, adap_tol=None, max_peid_ranks=None,
-                return_info=False, tensor_entry=None):
-    """Sliced PEID.  data: object with fetch_outer(rp, cp, k) (FunctionalTensor).
-
-    The cores are returned distributed, as they are computed: on every rank a
-    list of d entries, entry k being (lo, hi, slab) with slab = core_k[:, lo:hi, :]
-    when this rank computed that slice of the mode index, and None otherwise.
-    info["core_layout"][k] lists (world rank, lo, hi) of every slab of core k;
-    gather_tt_cores() assembles the full cores on one rank when they are needed
-    there.  The timings (info["construct_time"], per-rank info["local_time"])
-    cover the construction only, not any gather."""
-    import time
-    d = len(tensor_dim)
-    n = d - 1
-    world_rank = comm.Get_rank()
-    world_size = comm.Get_size()
-    peid_size = world_size if max_peid_ranks is None else min(int(max_peid_ranks), world_size)
-    cores = [None] * d
-    info = None
-    elapsed = 0.0
-    if peid_size < d:                       # fewer ranks than dimensions: serial on rank 0
-        if world_rank == 0:
-            t0 = MPI.Wtime()
-            full = peid_serial_fast(data, FI, FJ, tensor_dim, adap_tol)
-            elapsed = MPI.Wtime() - t0
-            cores = [(0, int(tensor_dim[k]), full[k]) for k in range(d)]
-            info = {"core_group_sizes": [1] * d, "core_groups": [[0] for _ in range(d)],
-                    "dimension_times": None, "dimension_active_times": None,
-                    "total_time": elapsed, "construct_time": elapsed, "execution_mode": "serial_fast",
-                    "core_layout": [[(0, 0, int(tensor_dim[k]))] for k in range(d)]}
-        info = comm.bcast(info, root=0)
-        info["local_time"] = elapsed
-        info["peid_ranks"] = 1
-        info["inactive_ranks"] = list(range(1, world_size))
-        return (cores, info) if return_info else cores
-    active = world_rank < peid_size
-    pcomm = comm.Split(0 if active else MPI.UNDEFINED, world_rank)
-    if active:
-        rank = pcomm.Get_rank(); size = pcomm.Get_size()
-        FIl = [[tuple(int(v) for v in x) for x in FI[j]] for j in range(n)]
-        FJl = [[tuple(int(v) for v in x) for x in FJ[j]] for j in range(n)]
-        uK, _ = set_conversion([list(map(list, x)) for x in FIl], [list(map(list, x)) for x in FJl], tensor_dim)
-        I = [np.asarray(x, dtype=np.int64) for x in uK]
-        ranks_tt = [len(x) for x in FIl]
-        # ---- rank groups per dimension, proportional to the entries each extracts
-        work = []
-        for i in range(n):
-            R = 1 if i == 0 else len(FIl[i - 1])
-            work.append(R * tensor_dim[i] * len(FJl[i]))
-        work.append(len(FIl[n - 1]) * tensor_dim[n])            # last core
-        group_sizes = [1] * d
-        extra = size - d
-        if extra > 0:
-            w = np.asarray(work, dtype=float); prop = w / w.sum()
-            alloc = np.floor(prop * extra).astype(int)
-            for idx in np.argsort(prop * extra - alloc)[::-1][:extra - int(alloc.sum())]:
-                alloc[idx] += 1
-            group_sizes = [1 + int(a) for a in alloc]
-        groups, start = [], 0
-        for g in group_sizes:
-            groups.append(list(range(start, start + g))); start += g
-        gi = next(i for i, g in enumerate(groups) if rank in g)
-        roots = [g[0] for g in groups]
-        sub = pcomm.Split(gi, rank)
-        srank, ssize = sub.Get_rank(), sub.Get_size()
-        t0 = MPI.Wtime()
-        wait = 0.0
-        # ---- my slice of the mode index of dimension gi
-        nk = tensor_dim[gi]
-        edges = np.linspace(0, nk, ssize + 1).astype(int)
-        i_slice = np.arange(edges[srank], edges[srank + 1])
-        m = len(i_slice)
-        if gi < n:
-            prefixes = [()] if gi == 0 else FIl[gi - 1]
-            R = len(prefixes)
-            rp = _peid_row_parts(prefixes, i_slice, gi)
-            cp = np.asarray(FJl[gi], dtype=np.int64).reshape(len(FJl[gi]), d - gi - 1)
-            mat_local = data.fetch_outer(rp, cp, gi) if m else np.empty((0, len(FJl[gi])))
-            # TSQR, Q kept distributed; SVD of R on the group root, factor broadcast
-            q_local, r = qr_tsqr_local(mat_local, comm=sub, gather_q=False)
-            if srank == 0:
-                U, s_values, _ = np.linalg.svd(r)
-                rk = ranks_tt[gi]
-                if adap_tol is not None:
-                    rk = rank_cutoff(s_values, adap_tol)
-                U = U[:, :rk]
-            else:
-                U = None
-            U = sub.bcast(U, root=0)
-            rk = U.shape[1]
-            uj_local = q_local @ U                                   # rows (p, i_k in slice), p-major
-            # pivot rows I[gi] of uj_gi: row index p*nk + i_k; mine are those with i_k in my slice
-            lo, hi = edges[srank], edges[srank + 1]
-            pr_, ik_ = np.divmod(I[gi], nk)
-            mine = np.flatnonzero((ik_ >= lo) & (ik_ < hi))
-            own = (mine, uj_local[pr_[mine] * m + (ik_[mine] - lo), :]) if mine.size else (mine, np.empty((0, rk)))
-            parts = sub.gather(own, root=0)
-            if srank == 0:
-                Mnext = np.empty((len(I[gi]), rk))
-                for idx, rows_ in parts:
-                    Mnext[idx] = rows_
-                if gi + 1 <= n:
-                    req = pcomm.isend(Mnext, dest=roots[gi + 1], tag=2000 + gi + 1)
-            if gi == 0:
-                slab = uj_local.reshape(1, m, rk)
-            else:
-                if srank == 0:
-                    tw = MPI.Wtime()
-                    M = pcomm.recv(source=roots[gi - 1], tag=2000 + gi)
-                    wait += MPI.Wtime() - tw
-                else:
-                    M = None
-                M = sub.bcast(M, root=0)
-                if M.shape[0] != R:
-                    raise ValueError("peid_sliced needs the pivot rows to be exactly the prefixes (no extra sampling rows)")
-                B = uj_local.reshape(R, m * rk)                       # columns (i_k in slice, :) are local
-                slab = _solve_core(M, B).reshape(M.shape[1], m, rk)
-            if srank == 0 and gi + 1 <= n:
-                req.wait()
-        else:
-            # last core: X(uFI[n-1], i_{d-1}) solved against M_n, split by i_{d-1}
-            R = len(FIl[n - 1])
-            rp = np.asarray(FIl[n - 1], dtype=np.int64).reshape(R, n)
-            cp = np.asarray(i_slice, dtype=np.int64).reshape(m, 1)
-            mat_local = data.fetch_outer(rp, cp, n - 1) if m else np.empty((R, 0))
-            if srank == 0:
-                tw = MPI.Wtime()
-                M = pcomm.recv(source=roots[n - 1], tag=2000 + n)
-                wait += MPI.Wtime() - tw
-            else:
-                M = None
-            M = sub.bcast(M, root=0)
-            slab = _solve_core(M, mat_local).reshape(M.shape[1], m, 1)
-        elapsed = MPI.Wtime() - t0
-        # ---- the slab stays where it was computed; only timings and the layout travel
-        lo, hi = int(edges[srank]), int(edges[srank + 1])
-        cores[gi] = (lo, hi, slab)
-        tmax = sub.allreduce(elapsed, op=MPI.MAX)
-        res = pcomm.gather((gi, tmax, tmax - wait) if srank == 0 else None, root=0)
-        layout = pcomm.gather((gi, world_rank, lo, hi), root=0)
-        if rank == 0:
-            ordered = sorted(r_ for r_ in res if r_ is not None)
-            info = {"core_group_sizes": group_sizes, "core_groups": groups,
-                    "dimension_times": [x[1] for x in ordered],
-                    "dimension_active_times": [x[2] for x in ordered],
-                    "construct_time": max(x[1] for x in ordered),
-                    "core_layout": [[(r_, lo_, hi_) for (g_, r_, lo_, hi_) in sorted(layout) if g_ == k]
-                                    for k in range(d)],
-                    "execution_mode": "sliced"}
-        sub.Free()
-        pcomm.Free()
-    info = comm.bcast(info if world_rank == 0 else None, root=0)
-    info["local_time"] = elapsed
-    info["peid_ranks"] = peid_size
-    info["inactive_ranks"] = list(range(peid_size, world_size))
-    return (cores, info) if return_info else cores
+                return_info=False, tensor_entry=None, sample_row=None, sample_col=None, seed=None):
+    """Distributed PEID (Algorithm 3.1); now core_construct.peid_par_sliced, kept
+    under this name.  Cores come back distributed as (lo, hi, slab) per core."""
+    from core_construct import peid_par_sliced
+    return peid_par_sliced(data, FI, FJ, sample_row, sample_col, tensor_dim, comm, adap_tol=adap_tol,
+                           max_peid_ranks=max_peid_ranks, return_info=return_info, seed=seed)
 
 
 def gather_tt_cores(cores_local, comm, root=0):
@@ -2082,40 +1910,10 @@ def gather_tt_cores(cores_local, comm, root=0):
     return [np.concatenate([sl for _, sl in sorted(per[k], key=lambda x: x[0])], axis=1) for k in range(d)]
 
 
-def peid_serial_fast(data, FI, FJ, tensor_dim, adap_tol=None):
-    """The serial PEID with the same two fixes: block-form extraction and an LU
-    solve for the square systems.  Used when fewer ranks than dimensions."""
-    d = len(tensor_dim); n = d - 1
-    FIl = [[tuple(int(v) for v in x) for x in FI[j]] for j in range(n)]
-    FJl = [[tuple(int(v) for v in x) for x in FJ[j]] for j in range(n)]
-    uK, _ = set_conversion([list(map(list, x)) for x in FIl], [list(map(list, x)) for x in FJl], tensor_dim)
-    I = [np.asarray(x, dtype=np.int64) for x in uK]
-    cores, uj_prev = [], None
-    for i in range(n):
-        prefixes = [()] if i == 0 else FIl[i - 1]
-        R = len(prefixes)
-        rp = _peid_row_parts(prefixes, np.arange(tensor_dim[i]), i)
-        cp = np.asarray(FJl[i], dtype=np.int64).reshape(len(FJl[i]), d - i - 1)
-        mat = data.fetch_outer(rp, cp, i)
-        q, r = np.linalg.qr(mat, mode="reduced")
-        U, s_values, _ = np.linalg.svd(r)
-        rk = len(FIl[i])
-        if adap_tol is not None:
-            rk = rank_cutoff(s_values, adap_tol)
-        uj = q @ U[:, :rk]
-        if i == 0:
-            cores.append(uj.reshape(1, tensor_dim[0], rk))
-        else:
-            M = uj_prev[I[i - 1], :]
-            cores.append(_solve_core(M, uj.reshape(R, tensor_dim[i] * rk)).reshape(M.shape[1], tensor_dim[i], rk))
-        uj_prev = uj
-    R = len(FIl[n - 1])
-    rp = np.asarray(FIl[n - 1], dtype=np.int64).reshape(R, n)
-    cp = np.arange(tensor_dim[n], dtype=np.int64).reshape(-1, 1)
-    mat = data.fetch_outer(rp, cp, n - 1)
-    M = uj_prev[I[n - 1], :]
-    cores.append(_solve_core(M, mat).reshape(M.shape[1], tensor_dim[n], 1))
-    return cores
+def peid_serial_fast(data, FI, FJ, tensor_dim, adap_tol=None, sample_row=None, sample_col=None, seed=None):
+    """Serial PEID (Algorithm 3.1, left to right); now core_construct.peid_par_ltr_adap."""
+    from core_construct import peid_par_ltr_adap
+    return peid_par_ltr_adap(data, FI, FJ, sample_row, sample_col, tensor_dim, adap_tol=adap_tol, seed=seed)
 
 
 def peid_par_ltr_adap(tensor_entry,FI,FJ,sample_row,sample_col,tensor_dim,adap_tol = None):
